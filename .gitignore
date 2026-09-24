@@ -10,3 +10,4 @@ _PipelineCache/
 zig-out/
 src/generated/
 3rdparty/SDL2/
+.pi/

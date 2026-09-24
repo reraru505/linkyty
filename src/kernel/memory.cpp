@@ -2562,8 +2562,6 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
-	PRINT_NAME();
-
 	return PhysicalMemory::Size();
 }
 
@@ -2729,8 +2727,6 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len,
                                              size_t alignment, int memory_type,
                                              int64_t* phys_addr_out) {
-	PRINT_NAME();
-
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	LOGF("\t search_start = 0x%016" PRIx64 "\n"
@@ -2907,8 +2903,6 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
-	PRINT_NAME();
-
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	if (addr == nullptr) {
@@ -3066,8 +3060,6 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
-	PRINT_NAME();
-
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	LOGF("\t type = %d\n", type);
@@ -3085,8 +3077,6 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
                                              int64_t direct_memory_start, size_t alignment,
                                              const char* name) {
-	PRINT_NAME();
-
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	LOGF("\t name = %s\n", name != nullptr ? name : "(null)");

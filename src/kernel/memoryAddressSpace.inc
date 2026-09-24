@@ -4,14 +4,12 @@
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MIN = HOST_SYSTEM_MANAGED_MAX + 1u;
-#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
-static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
-static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
-#else
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
-#endif
-static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+static constexpr uint64_t HOST_USER_MAX            = 0xfbffffffffull;
+
+// Minimum size for which the kernel is asked to use transparent huge pages.
+static constexpr uint64_t HUGEPAGE_MIN_SIZE = 2ull * 1024u * 1024u;
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -43,39 +41,7 @@ public:
 	};
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
-		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
-		if (m_handle == nullptr) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
-			           static_cast<uint32_t>(GetLastError()));
-			return;
-		}
-		m_backing_base = static_cast<uint8_t*>(
-		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
-		if (m_backing_base == nullptr) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",
-			           static_cast<uint32_t>(GetLastError()));
-			CloseHandle(m_handle);
-			m_handle = nullptr;
-		}
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-#if defined(__APPLE__)
-		{
-			char shm_name[64];
-			snprintf(shm_name, sizeof(shm_name), "/kyty-dm-%d-%llx", static_cast<int>(getpid()),
-			         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
-			m_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-			if (m_fd >= 0) {
-				shm_unlink(shm_name);
-			}
-		}
-#else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
-#endif
+		m_fd = static_cast<int>(syscall(SYS_memfd_create, "LinKytyDirectMemory", MFD_CLOEXEC));
 		if (m_fd < 0) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
 			           errno);
@@ -96,22 +62,16 @@ public:
 			return;
 		}
 		m_backing_base = static_cast<uint8_t*>(backing);
-#endif
+		// The guest direct-memory alias is large and resident for the whole session: request
+		// transparent huge pages to cut host TLB pressure, and keep it out of core dumps.
+		// NOTE: madvise() accepts exactly one advice per call, and the advice values are not
+		// flags -- MADV_HUGEPAGE | MADV_DONTDUMP evaluates to 30, which the kernel rejects with
+		// EINVAL, silently applying neither advice. Issue them as two separate calls.
+		::madvise(m_backing_base, m_size, MADV_HUGEPAGE);
+		::madvise(m_backing_base, m_size, MADV_DONTDUMP);
 	}
 
 	~GuestBackingStore() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& [_, entry]: m_maps) {
-			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
-		}
-		m_maps.clear();
-		if (m_backing_base != nullptr) {
-			UnmapViewOfFile(m_backing_base);
-		}
-		if (m_handle != nullptr) {
-			CloseHandle(m_handle);
-		}
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		for (const auto& [_, entry]: m_maps) {
 			EXIT_IF(
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
@@ -123,7 +83,6 @@ public:
 		if (m_fd >= 0) {
 			close(m_fd);
 		}
-#endif
 	}
 
 	KYTY_CLASS_NO_COPY(GuestBackingStore);
@@ -142,15 +101,7 @@ public:
 		}
 	}
 
-	[[nodiscard]] bool IsAvailable() const {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return m_handle != nullptr && m_backing_base != nullptr;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-		return m_fd >= 0 && m_backing_base != nullptr;
-#else
-		return false;
-#endif
-	}
+	[[nodiscard]] bool IsAvailable() const { return m_fd >= 0 && m_backing_base != nullptr; }
 
 	[[nodiscard]] uint64_t GetBackingBase() const {
 		return reinterpret_cast<uint64_t>(m_backing_base);
@@ -234,23 +185,6 @@ public:
 			return false;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
-		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-			if (mapped != nullptr) {
-				UnmapViewPreservePlaceholder(mapped, size);
-				SetFailure(failure_reason, FailureReason::WrongHostAddress);
-			}
-			return false;
-		}
-
-		{
-			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
-		}
-		SetFailure(failure_reason, FailureReason::None);
-		return true;
-#else
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
@@ -261,7 +195,6 @@ public:
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
-#endif
 	}
 
 	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
@@ -308,19 +241,6 @@ public:
 			removed.push_back(entry);
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
-		// records this contiguous guest span as one free range, so normalize fragmented backing
-		// views into one placeholder before publishing it there.
-		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
-			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
-				                                     it->mode));
-			}
-			return false;
-		}
-#endif
-
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
 		}
@@ -346,9 +266,6 @@ public:
 				auto entry = std::prev(next);
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-					m_maps.erase(entry);
-#endif
 				}
 			}
 		}
@@ -362,64 +279,6 @@ public:
 		const uint64_t old_end    = old.vaddr + old.size;
 		const uint64_t right_size = old_end - right_addr;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
-		if (exact_unmap) {
-			const bool unmapped =
-			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
-			if (!unmapped) {
-				std::lock_guard lock(m_mutex);
-				m_maps.emplace(old.vaddr, old);
-				return false;
-			}
-			if (placeholder_preserved != nullptr) {
-				*placeholder_preserved = true;
-			}
-			return true;
-		}
-
-		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
-			bool ok = true;
-			if (left_size != 0 && left_size != old.size) {
-				ok = SplitPlaceholder(old.vaddr, left_size) && ok;
-			}
-			if (right_size != 0) {
-				ok = SplitPlaceholder(vaddr, size) && ok;
-			}
-			if (left_size != 0) {
-				ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset,
-				                                 old.mode) &&
-				     ok;
-			}
-			if (right_size != 0) {
-				ok = MapExistingPlaceholderFixed(right_addr, right_size,
-				                                 old.backing_offset + (right_addr - old.vaddr),
-				                                 old.mode) &&
-				     ok;
-			}
-			if (ok) {
-				if (placeholder_preserved != nullptr) {
-					*placeholder_preserved = true;
-				}
-				return true;
-			}
-
-			if (left_size != 0 && Contains(old.vaddr, left_size)) {
-				EXIT_IF(!UnmapOne(old.vaddr, left_size));
-			}
-			if (right_size != 0 && Contains(right_addr, right_size)) {
-				EXIT_IF(!UnmapOne(right_addr, right_size));
-			}
-			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
-			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
-			EXIT_IF(
-			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
-			return false;
-		}
-		std::lock_guard lock(m_mutex);
-		m_maps.emplace(old.vaddr, old);
-		return false;
-#else
 		// Replace only the requested range so concurrent accesses and GPU watch
 		// protections on the surviving mappings remain intact.
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
@@ -442,7 +301,6 @@ public:
 			*placeholder_preserved = true;
 		}
 		return true;
-#endif
 	}
 
 	bool Contains(uint64_t vaddr, uint64_t size) {
@@ -540,63 +398,6 @@ private:
 		}
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static DWORD GetProtect(VirtualMemory::Mode mode) {
-		switch (mode) {
-			case VirtualMemory::Mode::Read: return PAGE_READONLY;
-			case VirtualMemory::Mode::Write:
-			case VirtualMemory::Mode::ReadWrite: return PAGE_READWRITE;
-			case VirtualMemory::Mode::Execute: return PAGE_EXECUTE;
-			case VirtualMemory::Mode::ExecuteRead: return PAGE_EXECUTE_READ;
-			case VirtualMemory::Mode::ExecuteWrite:
-			case VirtualMemory::Mode::ExecuteReadWrite: return PAGE_EXECUTE_READWRITE;
-			case VirtualMemory::Mode::NoAccess:
-			default: return PAGE_NOACCESS;
-		}
-	}
-
-	static bool ApplyProtection(void* ptr, uint64_t size, VirtualMemory::Mode mode) {
-		DWORD old_protect = 0;
-		return VirtualProtect(ptr, size, GetProtect(mode), &old_protect) != 0;
-	}
-
-	static bool SplitPlaceholder(uint64_t vaddr, uint64_t size) {
-		if (size == 0) {
-			return true;
-		}
-		return VirtualFree(reinterpret_cast<void*>(vaddr), size,
-		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
-	}
-
-	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
-	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
-		const DWORD map_protect =
-		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
-		void* ptr =
-		    MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr),
-		                   backing_offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
-			if (ptr != nullptr) {
-				UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
-			}
-			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
-			return nullptr;
-		}
-
-		if (!ApplyProtection(ptr, size, mode)) {
-			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
-			SetFailure(failure_reason, FailureReason::ProtectFailed);
-			return nullptr;
-		}
-		return ptr;
-	}
-
-	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t /*size*/) {
-		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
-	}
-
-	HANDLE m_handle = nullptr;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 
 	static int GetProtect(VirtualMemory::Mode mode) {
@@ -632,7 +433,6 @@ private:
 	}
 
 	int m_fd = -1;
-#endif
 
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
@@ -769,6 +569,11 @@ public:
 		                           : VirtualMemory::Mode::ReadWrite;
 		if (m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode,
 		                                           failure_reason)) {
+			// Guest views of direct memory are large and long-lived; ask the kernel to back them
+			// with transparent huge pages so guest TLB misses stay cheap.
+			if (size >= HUGEPAGE_MIN_SIZE) {
+				::madvise(reinterpret_cast<void*>(vaddr), size, MADV_HUGEPAGE);
+			}
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			return true;
 		}
@@ -1122,7 +927,6 @@ private:
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
 		}};
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		std::vector<std::pair<uint64_t, uint64_t>> occupied;
 		FILE*                                      maps = fopen("/proc/self/maps", "r");
 		EXIT_IF(maps == nullptr);
@@ -1190,27 +994,6 @@ private:
 				reserve_range(current, region_end);
 			}
 		}
-#else
-		for (const auto& [start, end]: regions) {
-			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
-			flags |= MAP_FIXED;
-#elif defined(MAP_FIXED_NOREPLACE)
-			flags |= MAP_FIXED_NOREPLACE;
-#endif
-			void* ptr = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE, flags, -1, 0);
-			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
-				if (ptr != MAP_FAILED) {
-					munmap(ptr, end - start);
-				}
-				EXIT("failed to reserve guest address space at 0x%016" PRIx64
-				     ", size 0x%016" PRIx64 "\n",
-				     start, end - start);
-			}
-			AddFreeUnlocked(start, end - start);
-			m_owned.emplace_back(start, end - start);
-		}
-#endif
 #endif
 	}
 

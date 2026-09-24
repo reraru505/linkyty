@@ -38,11 +38,7 @@ public:
 	Result Cancel(int set_count, int* num_waiting_threads);
 	Result Signal(int signal_count);
 	Result Wait(int need_count, uint32_t* ptr_micros);
-
-	Result Poll(int need_count) {
-		uint32_t micros = 0;
-		return Wait(need_count, &micros);
-	}
+	Result Poll(int need_count);
 
 	[[nodiscard]] const std::string& GetName() const { return m_name; }
 
@@ -59,7 +55,7 @@ private:
 
 	void AddWaiter(WaitingThread* waiter);
 	void RemoveWaiter(WaitingThread* waiter);
-	void WakeWaiters();
+	int  WakeWaiters();
 
 	Common::Mutex               m_mutex;
 	Common::CondVar             m_cond_var;
@@ -130,6 +126,19 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 	return Result::Ok;
 }
 
+int KernelSemaPrivate::WakeWaiters() {
+	int woken = 0;
+	for (auto* waiter: m_waiting_threads) {
+		if (!waiter->ready && waiter->need_count <= m_count) {
+			m_count -= waiter->need_count;
+			waiter->result = Result::Ok;
+			waiter->ready  = true;
+			woken++;
+		}
+	}
+	return woken;
+}
+
 KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	Common::LockGuard lock(m_mutex);
 
@@ -143,11 +152,35 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 
 	m_count += signal_count;
 
-	WakeWaiters();
-
-	m_cond_var.SignalAll();
+	if (!m_waiting_threads.empty()) {
+		int woken = WakeWaiters();
+		if (woken == 1) {
+			m_cond_var.Signal();
+		} else if (woken > 1) {
+			m_cond_var.SignalAll();
+		}
+	}
 
 	return Result::Ok;
+}
+
+KernelSemaPrivate::Result KernelSemaPrivate::Poll(int need_count) {
+	if (need_count < 1 || need_count > m_max_count) {
+		return Result::InvalCount;
+	}
+
+	Common::LockGuard lock(m_mutex);
+
+	if (m_status == Status::Deleted) {
+		return Result::Deleted;
+	}
+
+	if (m_count >= need_count) {
+		m_count -= need_count;
+		return Result::Ok;
+	}
+
+	return Result::TimedOut;
 }
 
 void KernelSemaPrivate::AddWaiter(WaitingThread* waiter) {
@@ -170,82 +203,79 @@ void KernelSemaPrivate::RemoveWaiter(WaitingThread* waiter) {
 	}
 }
 
-void KernelSemaPrivate::WakeWaiters() {
-	for (auto* waiter: m_waiting_threads) {
-		if (!waiter->ready && waiter->need_count <= m_count) {
-			m_count -= waiter->need_count;
-			waiter->result = Result::Ok;
-			waiter->ready  = true;
-		}
-	}
-}
-
 KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_micros) {
-	Common::LockGuard lock(m_mutex);
-
 	if (need_count < 1 || need_count > m_max_count) {
 		return Result::InvalCount;
 	}
+
+	Common::LockGuard lock(m_mutex);
 
 	if (m_status == Status::Deleted) {
 		return Result::Deleted;
 	}
 
-	uint32_t micros     = 0;
-	bool     infinitely = true;
-	if (ptr_micros != nullptr) {
-		micros     = *ptr_micros;
-		infinitely = false;
-	}
-
-	uint32_t      elapsed = 0;
-	Common::Timer t;
-	t.Start();
-
-	int id = Common::Thread::GetThreadIdUnique();
-
 	if (m_count >= need_count) {
 		m_count -= need_count;
-		if (ptr_micros != nullptr) {
-			*ptr_micros = micros;
-		}
 		return Result::Ok;
 	}
 
-	if (!infinitely && micros == 0) {
+	if (ptr_micros != nullptr && *ptr_micros == 0) {
 		return Result::TimedOut;
 	}
 
+	const bool infinitely = (ptr_micros == nullptr);
+	const auto start_time = std::chrono::steady_clock::now();
+	const auto timeout_us =
+	    infinitely ? std::chrono::microseconds(0) : std::chrono::microseconds(*ptr_micros);
+	const auto deadline = infinitely ? std::chrono::steady_clock::time_point::max()
+	                                 : (start_time + timeout_us);
+
 	WaitingThread waiter {};
-	waiter.id         = id;
+	waiter.id         = Common::Thread::GetThreadIdUnique();
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
 
+	auto self = LibKernel::PthreadSelfOrNull();
+
 	while (!waiter.ready) {
-		if ((elapsed >= micros && !infinitely)) {
+		const auto now = std::chrono::steady_clock::now();
+		if (!infinitely && now >= deadline) {
 			RemoveWaiter(&waiter);
 			*ptr_micros = 0;
 			return Result::TimedOut;
 		}
 
-		if (infinitely) {
-			m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
+		if (self != nullptr && LibKernel::PthreadHasAnyPendingSignal(self)) {
+			const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+			const auto poll_step =
+			    infinitely ? std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
+			               : std::min(std::chrono::microseconds(SIGNAL_APC_POLL_MICROS), remaining);
+			m_cond_var.WaitFor(&m_mutex, static_cast<uint32_t>(poll_step.count()));
+			m_mutex.Unlock();
+			LibKernel::KernelDispatchPendingSignalForCurrentThread();
+			m_mutex.Lock();
 		} else {
-			m_cond_var.WaitFor(&m_mutex, micros - elapsed);
+			if (infinitely) {
+				m_cond_var.Wait(&m_mutex);
+			} else {
+				const auto remaining =
+				    std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+				m_cond_var.WaitFor(&m_mutex, static_cast<uint32_t>(remaining.count()));
+			}
 		}
-
-		m_mutex.Unlock();
-		LibKernel::KernelDispatchPendingSignalForCurrentThread();
-		m_mutex.Lock();
-
-		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
 	}
 
 	RemoveWaiter(&waiter);
 
 	if (ptr_micros != nullptr) {
-		*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			*ptr_micros = 0;
+		} else {
+			*ptr_micros = static_cast<uint32_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count());
+		}
 	}
 
 	return waiter.result;
@@ -307,8 +337,6 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 }
 
 int KYTY_SYSV_ABI KernelPollSema(KernelSema sem, int need) {
-	PRINT_NAME();
-
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}

@@ -55,6 +55,7 @@ public:
 	void Close();
 
 private:
+	int  GetTriggeredEventsLocked(KernelEvent* ev, int num);
 	void TriggerExpiredTimers(uint64_t now_ns);
 	bool GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait_micros) const;
 
@@ -89,7 +90,10 @@ void KernelEqueuePrivate::Close() {
 
 int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 	Common::LockGuard lock(m_mutex);
+	return GetTriggeredEventsLocked(ev, num);
+}
 
+int KernelEqueuePrivate::GetTriggeredEventsLocked(KernelEvent* ev, int num) {
 	EXIT_IF(num < 1);
 	if (m_closed) {
 		return KERNEL_ERROR_EBADF;
@@ -171,28 +175,35 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 		return KERNEL_ERROR_EBADF;
 	}
 
-	uint32_t      elapsed = 0;
-	Common::Timer t;
-	t.Start();
+	const bool infinitely = (micros == 0);
+	const auto start_time = std::chrono::steady_clock::now();
+	const auto timeout_us =
+	    infinitely ? std::chrono::microseconds(0) : std::chrono::microseconds(micros);
+	const auto deadline =
+	    infinitely ? std::chrono::steady_clock::time_point::max() : (start_time + timeout_us);
 
 	for (;;) {
-		int ret = GetTriggeredEvents(ev, num);
+		int ret = GetTriggeredEventsLocked(ev, num);
 
-		if (ret != 0 || (elapsed >= micros && micros != 0)) {
+		const auto now = std::chrono::steady_clock::now();
+		if (ret != 0 || (!infinitely && now >= deadline)) {
 			return ret;
 		}
 
 		uint32_t   timer_wait = 0;
 		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
-		if (micros == 0 && !has_timer) {
+		if (infinitely && !has_timer) {
 			m_cond_var.Wait(&m_mutex);
 		} else {
-			const auto external_wait = micros != 0 ? micros - elapsed : UINT32_MAX;
-			m_cond_var.WaitFor(&m_mutex,
-			                   has_timer ? std::min(external_wait, timer_wait) : external_wait);
+			const auto remaining_us =
+			    infinitely ? std::chrono::microseconds(UINT32_MAX)
+			               : std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+			const auto wait_us =
+			    has_timer ? std::min<uint64_t>(static_cast<uint64_t>(remaining_us.count()),
+			                                   static_cast<uint64_t>(timer_wait))
+			              : static_cast<uint64_t>(remaining_us.count());
+			m_cond_var.WaitFor(&m_mutex, static_cast<uint32_t>(wait_us));
 		}
-
-		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
 	}
 
 	return 0;
@@ -385,8 +396,6 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
-	PRINT_NAME();
-
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {
 		return KERNEL_ERROR_EBADF;
@@ -401,13 +410,6 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	}
 
 	EXIT_NOT_IMPLEMENTED(out == nullptr);
-
-	LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64 ", ev = 0x%016" PRIx64
-	     ", num = %d, timo = %s, thread_id = %d\n",
-	     owner->GetName().c_str(), reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	     static_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
-	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
-	     Common::Thread::GetThreadIdUnique());
 
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);

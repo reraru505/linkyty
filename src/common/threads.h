@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <pthread.h>
 #include <memory>
 #include <string>
 
@@ -14,8 +15,6 @@ using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 
 struct ThreadPrivate;
-struct MutexPrivate;
-struct CondVarPrivate;
 
 class Thread {
 public:
@@ -58,12 +57,14 @@ public:
 	void Unlock();
 	bool TryLock();
 
+	[[nodiscard]] pthread_mutex_t* GetNativeHandle() { return &m_mutex; }
+
 	friend class CondVar;
 
 	KYTY_CLASS_NO_COPY(Mutex);
 
 private:
-	std::unique_ptr<MutexPrivate> m_mutex;
+	pthread_mutex_t m_mutex {};
 };
 
 class CondVar {
@@ -76,12 +77,14 @@ public:
 	void Signal();
 	void SignalAll();
 
+	[[nodiscard]] pthread_cond_t* GetNativeHandle() { return &m_cond; }
+
 	static void SetWaitPollCallback(wait_poll_func_t callback);
 
 	KYTY_CLASS_NO_COPY(CondVar);
 
 private:
-	std::unique_ptr<CondVarPrivate> m_cond_var;
+	pthread_cond_t m_cond {};
 };
 
 class LockGuard {

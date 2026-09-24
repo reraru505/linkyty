@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
         "-Wno-deprecated-declarations",
         "-Wno-unused-function",
         "-Wno-unused-variable",
+        "-Wno-date-time",
     };
 
     const c_flags = [_][]const u8{
@@ -236,4 +237,42 @@ pub fn build(b: *std.Build) void {
     const run_test_cmd = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run synchronization unit tests");
     test_step.dependOn(&run_test_cmd.step);
+
+    // -------------------------------------------------------------------------
+    // Target 4: vm_allocation_tests (Guest virtual-memory allocation suite)
+    // -------------------------------------------------------------------------
+    // The suite exercises the guest address space and direct-memory backing store
+    // (KernelAllocateDirectMemory / KernelMapDirectMemory / munmap / placeholder reuse),
+    // so its instrumentation hooks are enabled for every translation unit in this target.
+    const vm_test_flags = cpp_flags ++ [_][]const u8{"-DKYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS"};
+
+    const vm_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    configureModule(b, vm_test_mod, &include_paths);
+    // The suite links against kernel/memory.cpp's GPU-fault and backing-store paths, which
+    // reference Libs::Graphics, so it needs the same source closure as the emulator itself
+    // (minus src/main.cpp) - exactly how sync_benchmark is built. Narrowing this to
+    // sources.common + sources.kernel + sources.loader leaves unresolved Graphics symbols.
+    addEmulatorSources(vm_test_mod, &vm_test_flags, &c_flags);
+    vm_test_mod.addCSourceFiles(.{
+        .files = &.{"tests/VirtualMemoryAllocationTests.cpp"},
+        .flags = &vm_test_flags,
+    });
+
+    const vm_test_exe = b.addExecutable(.{
+        .name = "vm_allocation_tests",
+        .root_module = vm_test_mod,
+    });
+
+    vm_test_exe.step.dependOn(&compile_shaders_cmd.step);
+    b.installArtifact(vm_test_exe);
+
+    const run_vm_test_cmd = b.addRunArtifact(vm_test_exe);
+    const vm_test_step = b.step("test-vm", "Run guest virtual-memory allocation unit tests");
+    vm_test_step.dependOn(&run_vm_test_cmd.step);
+    // Deliberately a separate step rather than folded into `test`: this suite needs the full
+    // emulator source closure (kernel/memory.cpp references Libs::Graphics), so it is an
+    // order of magnitude more expensive to build than the synchronization tests.
 }

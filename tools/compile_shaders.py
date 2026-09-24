@@ -50,7 +50,7 @@ def main():
         subprocess.run([glslang, "-V", "--target-env", "vulkan1.3", "-Os", f"-I{shader_dir}", "-o", spv, src], check=True)
         embed(spv, hdr, f"{name.upper()}_SPV")
 
-    print("Kyty shaders compiled and embedded successfully.")
+    print("LinKyty shaders compiled and embedded successfully.")
 
 if __name__ == "__main__":
     main()
