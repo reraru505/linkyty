@@ -10,6 +10,9 @@
 
 It is an opinionated hard fork of [Kyty](https://github.com/InoriRus/Kyty) and [KytyPS5](https://github.com/KytyPS5/KytyPS5), re-engineered specifically for **Steam, Steam Deck, Lutris, and headless CLI runners**.
 
+> [!CAUTION]
+> **DISCLAIMER**: This is a vibe slopped project , I am reviewing the things i can , but some code may not be reviewed.
+
 > [!IMPORTANT]
 > LinKyty is not affiliated with Sony Interactive Entertainment or PlayStation. The project does not distribute games, firmware, decryption keys, or copyrighted system software. Use only game files and ELFs that you have obtained legally.
 
