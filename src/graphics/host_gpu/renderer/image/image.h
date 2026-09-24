@@ -1,7 +1,6 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
-#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -124,6 +123,10 @@ public:
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
+	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
+	void               MarkStencilModified() noexcept { m_stencil_modified = true; }
+	void               ClearStencilModified() noexcept { m_stencil_modified = false; }
+
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
@@ -134,7 +137,7 @@ public:
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
-		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
+		return backing.image == nullptr ? 0 : (info.data.size + 1023) & ~uint64_t {1023};
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
@@ -168,6 +171,7 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_stencil_modified  = false;
 };
 
 namespace ImageOps {

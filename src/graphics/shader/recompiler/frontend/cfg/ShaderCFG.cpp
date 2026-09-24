@@ -7,7 +7,6 @@
 #include <iterator>
 #include <map>
 #include <set>
-#include <span>
 #include <stack>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -52,6 +51,26 @@ uint32_t ProgramEndPc(const Decoder::Program& program) {
 	return InstructionEndPc(program.instructions.back());
 }
 
+bool IsUnconditionalBranch(Opcode opcode) {
+	return opcode == Opcode::S_BRANCH;
+}
+
+bool IsConditionalBranch(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::S_CBRANCH_SCC0:
+		case Opcode::S_CBRANCH_SCC1:
+		case Opcode::S_CBRANCH_VCCZ:
+		case Opcode::S_CBRANCH_VCCNZ:
+		case Opcode::S_CBRANCH_EXECZ:
+		case Opcode::S_CBRANCH_EXECNZ: return true;
+		default: return false;
+	}
+}
+
+bool IsBranch(Opcode opcode) {
+	return IsUnconditionalBranch(opcode) || IsConditionalBranch(opcode);
+}
+
 BranchCondition ConditionForOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::S_BRANCH: return BranchCondition::Always;
@@ -61,8 +80,6 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_CBRANCH_VCCNZ: return BranchCondition::VccNonZero;
 		case Opcode::S_CBRANCH_EXECZ: return BranchCondition::ExecZero;
 		case Opcode::S_CBRANCH_EXECNZ: return BranchCondition::ExecNonZero;
-		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
-		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
 	}
 }
@@ -306,10 +323,11 @@ bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before
 	return false;
 }
 
-void AddUnique(std::vector<uint32_t>& values, uint32_t value) {
-	if (std::find(values.begin(), values.end(), value) == values.end()) {
-		values.push_back(value);
+bool AddUniqueTargetPc(std::vector<uint32_t>& targets, uint32_t target) {
+	if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
+		targets.push_back(target);
 	}
+	return true;
 }
 
 bool ScalarCodeWrittenInRange(const Decoder::Program& program, uint32_t begin_index,
@@ -403,7 +421,7 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 			return false;
 		}
 		const auto target_pc = (target_base + low) & ~3u;
-		AddUnique(targets, target_pc);
+		AddUniqueTargetPc(targets, target_pc);
 		selector_values.push_back(i * 8u);
 		selector_target_pcs.push_back(target_pc);
 	}
@@ -489,7 +507,7 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 			return false;
 		}
 		const auto target_pc = (target_base - offset) & ~3u;
-		AddUnique(targets, target_pc);
+		AddUniqueTargetPc(targets, target_pc);
 		selector_values.push_back(i * 4u);
 		selector_target_pcs.push_back(target_pc);
 	}
@@ -570,6 +588,12 @@ bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
 bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, uint32_t first_pc,
                    uint32_t end_pc) {
 	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
+}
+
+void AddUnique(std::vector<uint32_t>& values, uint32_t value) {
+	if (std::find(values.begin(), values.end(), value) == values.end()) {
+		values.push_back(value);
+	}
 }
 
 std::vector<uint32_t> AllBlockIds(uint32_t count) {
@@ -844,15 +868,15 @@ void ComputeNaturalLoops(Graph& graph) {
 		loop.header         = edge.to;
 		loop.latch          = edge.from;
 		loop.continue_block = edge.from;
-		loop.body_blocks    = std::move(body);
+		loop.body_blocks    = body;
 
-		for (auto block_id: loop.body_blocks) {
+		for (auto block_id: body) {
 			const auto* block = graph.FindBlock(block_id);
 			if (block == nullptr) {
 				continue;
 			}
 			for (auto succ: block->successors) {
-				if (!Contains(loop.body_blocks, succ)) {
+				if (!Contains(body, succ)) {
 					AddUnique(loop.exit_blocks, succ);
 				}
 			}
@@ -971,29 +995,6 @@ void RecomputeAnalyses(Graph& graph) {
 	ComputeComponents(graph);
 }
 
-std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> blocks) {
-	std::vector<uint32_t> id_map(blocks.size(), UINT32_MAX);
-	for (uint32_t i = 0; i < blocks.size(); i++) {
-		id_map[blocks[i].id] = i;
-	}
-
-	graph.blocks      = std::move(blocks);
-	graph.entry_block = RemapId(graph.entry_block, id_map);
-	for (auto& block: graph.blocks) {
-		block.id = RemapId(block.id, id_map);
-		RemapIds(block.predecessors, id_map);
-		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
-		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
-		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
-		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
-		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
-	}
-
-	return id_map;
-}
-
 uint32_t MoveBlockBefore(Graph& graph, uint32_t block_id, uint32_t before_id) {
 	if (block_id == before_id || block_id >= graph.blocks.size() ||
 	    before_id >= graph.blocks.size()) {
@@ -1015,7 +1016,24 @@ uint32_t MoveBlockBefore(Graph& graph, uint32_t block_id, uint32_t before_id) {
 		}
 	}
 
-	const auto id_map = ApplyBlockOrder(graph, std::move(new_blocks));
+	std::vector<uint32_t> id_map(new_blocks.size(), UINT32_MAX);
+	for (uint32_t i = 0; i < new_blocks.size(); i++) {
+		id_map[new_blocks[i].id] = i;
+	}
+
+	graph.blocks      = std::move(new_blocks);
+	graph.entry_block = RemapId(graph.entry_block, id_map);
+	for (auto& block: graph.blocks) {
+		block.id = RemapId(block.id, id_map);
+		RemapIds(block.predecessors, id_map);
+		RemapIds(block.successors, id_map);
+		RemapIds(block.dominators, id_map);
+		RemapIds(block.post_dominators, id_map);
+		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
+		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
+		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
+		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
+	}
 
 	return RemapId(block_id, id_map);
 }
@@ -1206,12 +1224,13 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 					return false_target;
 				}
 				// A return can leave a selection without reaching its merge. Keep the
-				// continuing arm as the merge. Shared continuations receive a dedicated
-				// gateway in SplitSharedMergeBlock before structured control is emitted.
-				if (HasLinearPathToTerminal(graph, true_target)) {
+				// continuing arm as the merge instead of joining live state with a return.
+				if (graph.Dominates(block.id, false_target) &&
+				    HasLinearPathToTerminal(graph, true_target)) {
 					return false_target;
 				}
-				if (HasLinearPathToTerminal(graph, false_target)) {
+				if (graph.Dominates(block.id, true_target) &&
+				    HasLinearPathToTerminal(graph, false_target)) {
 					return true_target;
 				}
 			}
@@ -1377,16 +1396,16 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	}
 
 	std::vector<uint32_t> construct_predecessors;
-	bool                  has_external_predecessor = false;
+	std::vector<uint32_t> external_predecessors;
 	for (auto pred: merge_block->predecessors) {
 		if (Contains(construct_blocks, pred)) {
 			AddUnique(construct_predecessors, pred);
 		} else {
-			has_external_predecessor = true;
+			AddUnique(external_predecessors, pred);
 		}
 	}
 
-	if (construct_predecessors.empty() || (!force_split && !has_external_predecessor)) {
+	if (construct_predecessors.empty() || (!force_split && external_predecessors.empty())) {
 		return false;
 	}
 	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
@@ -1637,7 +1656,24 @@ void PlaceGotoRouteBlocks(Graph& graph, uint32_t original_block_count,
 		new_blocks.push_back(std::move(old_blocks[block_id]));
 	}
 
-	ApplyBlockOrder(graph, std::move(new_blocks));
+	std::vector<uint32_t> id_map(new_blocks.size(), UINT32_MAX);
+	for (uint32_t block_id = 0; block_id < new_blocks.size(); block_id++) {
+		id_map[new_blocks[block_id].id] = block_id;
+	}
+
+	graph.blocks      = std::move(new_blocks);
+	graph.entry_block = RemapId(graph.entry_block, id_map);
+	for (auto& block: graph.blocks) {
+		block.id = RemapId(block.id, id_map);
+		RemapIds(block.predecessors, id_map);
+		RemapIds(block.successors, id_map);
+		RemapIds(block.dominators, id_map);
+		RemapIds(block.post_dominators, id_map);
+		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
+		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
+		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
+		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
+	}
 }
 
 uint32_t AppendGotoSelectBlock(Graph& graph, uint32_t route_variable, uint32_t true_target,
@@ -1731,7 +1767,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 		    inner_is_true ? outer->terminator.false_block : outer->terminator.true_block;
 		const auto* inner = graph.FindBlock(inner_id);
 		if (inner == nullptr || inner->inst_begin == inner->inst_end ||
-		    inner->predecessors.size() != 1u || inner->predecessors.front() != outer_id ||
+		    inner->predecessors != std::vector<uint32_t> {outer_id} ||
 		    inner->terminator.kind != TerminatorKind::ConditionalBranch ||
 		    IsInnermostLoopControlConditional(graph, *inner)) {
 			continue;
@@ -1906,7 +1942,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
-		if (Decoder::IsDirectBranch(inst.opcode)) {
+		if (IsBranch(inst.opcode)) {
 			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
@@ -1923,9 +1959,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
-			const auto target_pcs = target_info.indirect
-			                            ? std::span<const uint32_t>(target_info.target_pcs)
-			                            : std::span<const uint32_t>(&target_info.target, 1);
+			const auto& target_pcs = target_info.indirect
+			                             ? target_info.target_pcs
+			                             : std::vector<uint32_t> {target_info.target};
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
 					ExitBuildFailure(
@@ -1945,6 +1981,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 
 	std::vector<uint32_t> sorted_labels(labels.begin(), labels.end());
+	std::sort(sorted_labels.begin(), sorted_labels.end());
 	for (uint32_t i = 0; i < sorted_labels.size(); i++) {
 		const auto start = sorted_labels[i];
 		if (start > end_pc) {
@@ -2013,11 +2050,11 @@ Graph BuildGraph(const Decoder::Program& program) {
 				block.terminator.condition  = BranchCondition::Always;
 				block.terminator.true_block = pc_to_block.at(target_info.target);
 			}
-		} else if (last.opcode == Opcode::S_BRANCH) {
+		} else if (IsUnconditionalBranch(last.opcode)) {
 			block.terminator.kind       = TerminatorKind::Branch;
 			block.terminator.condition  = BranchCondition::Always;
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
-		} else if (Decoder::IsConditionalBranch(last.opcode)) {
+		} else if (IsConditionalBranch(last.opcode)) {
 			block.terminator.kind       = TerminatorKind::ConditionalBranch;
 			block.terminator.condition  = ConditionForOpcode(last.opcode);
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
@@ -2085,7 +2122,11 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 	SortUnique(graph.code_table_load_pcs);
 
-	RecomputeAnalyses(graph);
+	ComputeDominators(graph);
+	ComputePostDominators(graph);
+	ComputeBackEdges(graph);
+	ComputeNaturalLoops(graph);
+	ComputeComponents(graph);
 
 	if (indirect_setpc) {
 		graph.irreducible  = true;
@@ -2192,38 +2233,27 @@ bool StructurizeImpl(Graph& graph) {
 } // namespace
 
 bool Structurize(Graph& graph) {
-	Graph structured = graph;
-	if (StructurizeImpl(structured)) {
-		graph = std::move(structured);
+	Graph original = graph;
+	if (StructurizeImpl(graph)) {
 		return true;
 	}
 
-	const auto failure_kind = structured.failure_kind;
-	// Structurization inserts and renumbers blocks. Recover source identity for a
-	// semantic block; a synthetic block has no corresponding original diagnostic ID.
-	const auto* failed = structured.FindBlock(structured.failure_block);
-	const auto original = std::ranges::find_if(graph.blocks, [&](const BasicBlock& block) {
-		return failed != nullptr && failed->inst_begin != failed->inst_end &&
-		       block.inst_begin == failed->inst_begin && block.inst_end == failed->inst_end &&
-		       block.start_pc == failed->start_pc && block.end_pc == failed->end_pc;
-	});
-	const auto failure_block = original != graph.blocks.end() ? original->id : UINT32_MAX;
-	auto failure_reason = std::move(structured.unsupported_reason);
-	Graph routed = graph;
+	Graph failed_graph      = std::move(graph);
+	graph                   = std::move(original);
 	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
 	// Apply one route at a time and retry. Eagerly routing every matching diamond can
 	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
-		if (!RouteSharedSelectionArm(routed, route_variable)) {
+		if (!RouteSharedSelectionArm(graph, route_variable)) {
 			break;
 		}
-		structured = routed;
-		if (StructurizeImpl(structured)) {
-			graph = std::move(structured);
+		Graph routed = graph;
+		if (StructurizeImpl(routed)) {
+			graph = std::move(routed);
 			return true;
 		}
 	}
-	SetFailure(graph, failure_kind, failure_block, failure_reason);
+	graph = std::move(failed_graph);
 	return false;
 }
 
@@ -2236,7 +2266,6 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::VccNonZero: return "vccnz";
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
-		case BranchCondition::ScalarInstruction: return "scalar_instruction";
 		case BranchCondition::GotoVariable: return "goto_variable";
 		default: return "unknown";
 	}

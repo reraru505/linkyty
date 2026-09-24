@@ -112,10 +112,6 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
-	// Planning expressions can refer to block values but outlive block storage in the base class.
-	for (auto& inst: value_storage) {
-		inst.Invalidate();
-	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
 	for (auto* block: blocks) {
@@ -188,48 +184,33 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
-bool HasShaderMemoryWrites(const Program& program) {
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			const auto op     = inst.GetOpcode();
-			const auto buffer = BufferAccessOf(op);
-			const auto image  = ImageOpcodeInfoOf(op).access;
-			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
-			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 void ValidateProgram(const Program& program, bool require_ssa) {
 	if (program.blocks.size() != program.block_info.size() ||
 	    program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");
 	}
+	std::unordered_set<const Block*>           blocks;
 	std::unordered_map<const Block*, size_t>   block_indices;
 	std::unordered_map<uint32_t, const Block*> blocks_by_id;
-	std::unordered_map<const Inst*, size_t>    instruction_positions;
+	std::unordered_set<const Inst*>            instructions;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto* block = program.blocks[block_index];
 		if (block == nullptr || program.block_storage[block_index] == nullptr ||
 		    block != program.block_storage[block_index].get()) {
 			return Fail("value IR block pointer is inconsistent");
 		}
-		if (!block_indices.emplace(block, block_index).second) {
+		if (!blocks.insert(block).second) {
 			return Fail("value IR block pointer is duplicated");
 		}
+		block_indices.emplace(block, block_index);
 		if (program.block_info[block_index].id == UINT32_MAX) {
 			return Fail("value IR block uses the reserved exit id");
 		}
 		if (!blocks_by_id.emplace(program.block_info[block_index].id, block).second) {
 			return Fail("value IR block id is duplicated");
 		}
-		size_t position = 0;
 		for (const auto& inst: *block) {
-			if (!instruction_positions.emplace(&inst, position++).second) {
+			if (!instructions.insert(&inst).second) {
 				return Fail("value IR instruction is duplicated");
 			}
 		}
@@ -242,7 +223,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		const auto*                      block = program.blocks[block_index];
 		std::unordered_set<const Block*> predecessors;
 		for (const auto* predecessor: block->ImmPredecessors()) {
-			if (predecessor == nullptr || !block_indices.contains(predecessor)) {
+			if (predecessor == nullptr || !blocks.contains(predecessor)) {
 				return Fail("value IR block has a foreign predecessor");
 			}
 			if (!predecessors.insert(predecessor).second) {
@@ -256,7 +237,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 
 		std::unordered_set<const Block*> successors;
 		for (const auto* successor: block->ImmSuccessors()) {
-			if (successor == nullptr || !block_indices.contains(successor)) {
+			if (successor == nullptr || !blocks.contains(successor)) {
 				return Fail("value IR block has a foreign successor");
 			}
 			if (!successors.insert(successor).second) {
@@ -283,7 +264,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				return false;
 			}
 			const auto* definition = value.TryInstruction();
-			return definition == nullptr || instruction_positions.contains(definition);
+			return definition == nullptr || instructions.contains(definition);
 		};
 		switch (terminator.kind) {
 			case CFG::TerminatorKind::Branch:
@@ -357,7 +338,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				std::unordered_set<const Block*> incoming_blocks;
 				for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
 					const auto* predecessor = inst.PhiBlock(arg_index);
-					if (predecessor == nullptr || !block_indices.contains(predecessor) ||
+					if (predecessor == nullptr || !blocks.contains(predecessor) ||
 					    !predecessors.contains(predecessor)) {
 						return Fail("value IR Phi has a foreign or non-predecessor parent");
 					}
@@ -447,20 +428,13 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				const bool  vector_buffer = memory.kind == ResourceKind::Buffer ||
-				                            memory.kind == ResourceKind::IndirectBuffer;
-				if (!vector_buffer && memory.kind != ResourceKind::ScalarBuffer) {
+				if (memory.kind != ResourceKind::Buffer &&
+				    memory.kind != ResourceKind::ScalarBuffer) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
-				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    (memory.formatted || memory.typed ||
-				     (inst.GetOpcode() != ValueOpcode::LoadBufferU32x2 &&
-				      inst.GetOpcode() != ValueOpcode::LoadBufferU32x4))) {
-					return Fail("indirect buffer requires a raw DWORD x2/x4 load");
-				}
 				if (buffer_components > 1u &&
-				    (!vector_buffer || memory.data_bits != 32u ||
+				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));
@@ -546,7 +520,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        TypeName(ArgTypeOf(inst.GetOpcode(), arg_index))));
 				}
 				if (const auto* definition = arg.TryInstruction();
-				    definition != nullptr && !instruction_positions.contains(definition)) {
+				    definition != nullptr && !instructions.contains(definition)) {
 					return Fail("value IR argument has a foreign definition");
 				}
 				if (const auto* definition = arg.TryInstruction(); definition != nullptr) {
@@ -608,6 +582,13 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		}
 	}
 
+	std::unordered_map<const Inst*, size_t> instruction_positions;
+	for (const auto* block: program.blocks) {
+		size_t position = 0;
+		for (const auto& inst: *block) {
+			instruction_positions.emplace(&inst, position++);
+		}
+	}
 	const auto dominates = [&](const Block* definition, const Block* use) {
 		return dominators[block_indices.at(use)][block_indices.at(definition)];
 	};

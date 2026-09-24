@@ -16,7 +16,9 @@
 
 namespace Libs::Graphics {
 
-struct ShaderStageRuntime;
+namespace ShaderRecompiler::IR {
+struct ResourceSnapshot;
+}
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -33,8 +35,8 @@ struct PreparedBindings {
 		BufferId id;
 	};
 
-	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
-	const ShaderStageRuntime* runtime = nullptr;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
@@ -66,6 +68,9 @@ template <typename T>
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
+[[nodiscard]] bool
+IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, const Image& image);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
 

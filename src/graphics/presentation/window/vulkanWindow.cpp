@@ -1063,7 +1063,7 @@ void WindowContext::CreateVulkan() {
 	}
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
-	LibKernel::Memory::InstallGpuResources(render_context.get());
+	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
 	presenter = std::make_unique<Presenter>(*this);
 }
 

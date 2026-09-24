@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -13,6 +14,7 @@ struct EmbeddedFetchLoad {
 	uint32_t              pc         = 0;
 	int                   attrib_id  = -1;
 	uint32_t              components = 0;
+	std::vector<uint32_t> prolog_loads;
 };
 
 struct EmbeddedFetchPlan {
@@ -27,7 +29,13 @@ struct TranslateOptions {
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;
-	ShaderStageInputInfo          input_info;
+	uint32_t                      scratch_dwords      = 0;
+	bool                          dispatcher_fallback = false;
+	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
+	std::string_view              fallback_reason;
+	const ShaderVertexInputInfo*  vertex         = nullptr;
+	const ShaderPixelInputInfo*   pixel          = nullptr;
+	const ShaderComputeInputInfo* compute        = nullptr;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
 };
 

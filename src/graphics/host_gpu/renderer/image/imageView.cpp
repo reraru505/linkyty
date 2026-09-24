@@ -322,12 +322,6 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
-	for (const auto& cached: views) {
-		if (cached.info == normalized) {
-			return cached.view;
-		}
-	}
-
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
 	const bool slice_view =
@@ -357,16 +351,16 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
+	for (const auto& cached: views) {
+		if (cached.info == normalized) {
+			return cached.view;
+		}
+	}
+
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = image.usage;
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
-	}
-	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
-		min_lod.minLod = static_cast<float>(normalized.base_level) +
-		                 static_cast<float>(normalized.min_lod) / 256.0f;
-		usage.pNext    = &min_lod;
 	}
 	vk::ImageViewCreateInfo create {};
 	create.pNext                           = &usage;

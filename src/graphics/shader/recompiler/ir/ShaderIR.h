@@ -14,7 +14,6 @@
 
 #include <array>
 #include <bit>
-#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -28,7 +27,6 @@ enum class ResourceKind {
 	ScalarBuffer,
 	ScalarAddress,
 	Buffer,
-	IndirectBuffer,
 	Flat,
 	Global,
 	Scratch,
@@ -59,12 +57,17 @@ struct MemoryInfo {
 	uint32_t                image_sample_flags       = 0;
 	Decoder::ImageDimension image_dimension          = Decoder::ImageDimension::Unknown;
 	uint32_t                image_address_components = 0;
+	uint32_t                image_nsa_dwords         = 0;
+	uint32_t                image_nsa_addr[Decoder::MaxImageNsaAddressComponents] = {};
+	uint32_t                memory_segment                                        = 0;
 	bool                    address_is_full                                       = false;
 	bool                    data_signed                                           = false;
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	bool                    glc                                                   = false;
+	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    planning_only                                         = false;
@@ -152,20 +155,8 @@ struct SampledResourcePair {
 	bool operator==(const SampledResourcePair& other) const = default;
 };
 
-enum class TessellationAttribute {
-	LocalOutput,
-	ControlInput,
-	ControlOutput,
-	EvaluationInput,
-	PatchOutput,
-	Factor
-};
-
 enum class StageInputKind {
 	VertexIndex,
-	InvocationId,
-	PrimitiveId,
-	TessCoord,
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
@@ -173,7 +164,6 @@ enum class StageInputKind {
 	Layer,
 	SampleId,
 	BaryCoordSmooth,
-	BaryCoordSmoothCentroid,
 	BaryCoordNoPerspective,
 	WorkgroupId,
 	LocalInvocationId,
@@ -302,12 +292,8 @@ static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
-	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
-	                       : stage == ShaderType::TessellationControl    ? 2u
-	                       : stage == ShaderType::TessellationEvaluation ? 3u
-	                                                                     : 0u;
 	return static_cast<uint32_t>(kind) +
-	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
+	       (stage == ShaderType::Pixel ? static_cast<uint32_t>(DescriptorBindingKind::Count) : 0u);
 }
 
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
@@ -429,7 +415,7 @@ struct BindingLayout {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxImages       = 64;
+	static constexpr uint32_t MaxImages       = 32;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
@@ -448,6 +434,18 @@ struct ShaderInfo {
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
+struct SpirvRequirements {
+	bool subgroup_ballot              = false;
+	bool subgroup_shuffle             = false;
+	bool subgroup_local_invocation_id = false;
+	bool compute_derivatives          = false;
+	bool image_gather_extended        = false;
+	bool function_lds                 = false;
+	bool function_scratch             = false;
+	bool pixel_valid_mask             = false;
+	bool buffer_int64_atomics         = false;
+};
+
 struct BlockInfo {
 	uint32_t        id       = 0;
 	uint32_t        start_pc = 0;
@@ -459,13 +457,17 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectImage {
-		uint32_t material_source = UINT32_MAX;
-		uint32_t table_source    = 0;
+		uint32_t material_source = 0;
+		uint32_t heap_source     = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
-		uint32_t table_offset    = 0;
-		Value    key_count;
-		Value    selector_mask;
+		uint32_t key_arg         = 0;
+		uint32_t table_offset = 0;
+		uint32_t key_bound    = 0;
+		static constexpr uint32_t NoBoundSource = UINT32_MAX;
+		uint32_t                  bound_source  = NoBoundSource;
+		bool                      bound_signed  = false;
+		uint32_t item_bound = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
@@ -509,19 +511,9 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
-// Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
-// condition and fill values without translated blocks, plus reusable evaluation scratch.
+// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
+// uniform condition and fill values without retaining translated blocks.
 struct ResourcePlan {
-	struct EvaluationContext {
-		struct Entry {
-			uint64_t value      = 0;
-			uint64_t generation = 0;
-		};
-
-		std::vector<Entry> values;
-		uint64_t           generation = 0;
-	};
-
 	ResourcePlan() = default;
 	~ResourcePlan();
 
@@ -538,23 +530,14 @@ struct ResourcePlan {
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
+	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
-	bool                                has_address_writes = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
 struct Program: ResourcePlan {
@@ -575,18 +558,19 @@ struct Program: ResourcePlan {
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
-	// Typed memory and export instructions reference shader-local metadata by dense index.
-	// Decoder-only details (such as NSA register numbers) have already become IR operands.
+	// Decoded MIMG/VMEM metadata carries details such as RDNA2 NSA address registers and
+	// storage-image swizzles. Typed memory instructions carry a dense index into these shader-local
+	// tables until those fields are consumed by emission.
 	std::vector<ExportInfo>       export_info;
 	std::vector<Value>            dynamic_reads;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
 
+	std::optional<SpirvRequirements> spirv_requirements;
 };
 
 std::string ProgramToString(const Program& program);
-bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);

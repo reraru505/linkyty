@@ -8,12 +8,9 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_MOV_B32:
 		case O::S_MOVK_I32: MOV_B32(inst, false); return true;
 		case O::S_MOV_B64: S_MOV_B64(inst); return true;
-		case O::S_WQM_B32: S_WQM(inst, false); return true;
-		case O::S_WQM_B64: S_WQM(inst, true); return true;
+		case O::S_WQM_B64: S_WQM_B64(inst); return true;
 		case O::S_GETPC_B64: S_GETPC_B64(inst); return true;
 		case O::S_SETPC_B64: return true;
-		case O::S_SUBVECTOR_LOOP_BEGIN: S_SUBVECTOR_LOOP(inst, true); return true;
-		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return true;
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return true;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return true;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return true;
@@ -25,9 +22,6 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return true;
 		case O::S_ANDN1_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
-			return true;
-		case O::S_ORN2_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, false);
 			return true;
 		case O::S_AND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
@@ -138,8 +132,6 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return SimpleInteger(inst, IR::ValueOpcode::IMul32, IR::Type::U32, false, false, false);
 		case O::S_MUL_HI_U32:
 			return SimpleInteger(inst, IR::ValueOpcode::UMulHi, IR::Type::U32, false, false, false);
-		case O::S_MUL_HI_I32:
-			return SimpleInteger(inst, IR::ValueOpcode::SMulHi, IR::Type::U32, false, false, false);
 		case O::S_AND_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitwiseAnd32, IR::Type::U32, false, false,
 			                     true);
@@ -179,7 +171,6 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_LSHR_B64:
 			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightLogical64, IR::Type::U64, false,
 			                     false, true);
-		case O::S_ASHR_I64: return S_ASHR_I64(inst);
 
 		case O::S_ANDN2_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseAnd32, true, false, true);
@@ -208,8 +199,6 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BFE_U64: return S_BFE_U64(inst);
 		case O::S_BITCMP0_B32: return S_BITCMP_B32(inst, false);
 		case O::S_BITCMP1_B32: return S_BITCMP_B32(inst, true);
-		case O::S_BITCMP0_B64: return S_BITCMP_B64(inst, false);
-		case O::S_BITCMP1_B64: return S_BITCMP_B64(inst, true);
 		case O::S_PACK_LL_B32_B16: return PackB16(inst, false, false);
 		case O::S_PACK_LH_B32_B16: return PackB16(inst, false, true);
 		case O::S_PACK_HH_B32_B16: return PackB16(inst, true, true);
@@ -230,7 +219,6 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_VCCNZ:
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
-		case O::S_CBRANCH_CDBGSYS:
 		case O::S_ENDPGM: return true;
 		default: return false;
 	}

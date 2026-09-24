@@ -6,6 +6,8 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+_SaveData/
+_Trophy/
 .zig-cache/
 zig-out/
 src/generated/

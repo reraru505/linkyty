@@ -14,7 +14,9 @@
 
 namespace Libs::Graphics {
 
+struct VulkanBuffer;
 struct VulkanImage;
+struct VulkanMemory;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -27,12 +29,13 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                               mesh_shader_enabled                   = false;
 	bool                               provoking_vertex_last_enabled         = false;
-	bool                               supports_block_texel_view              = false;
-	bool                                      mesh_shader_enabled                   = false;
+	bool                               supports_block_texel_view             = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -98,6 +101,10 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	void                   AppendHardwareRayTracingDeviceExtensions(
+	    const std::vector<vk::ExtensionProperties>& available_extensions,
+	    std::vector<const char*>&                   device_extensions);
+	void LoadHardwareRayTracingFunctions() const;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
@@ -110,6 +117,14 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+};
+
+struct VulkanMemory {
+	vk::MemoryRequirements  requirements       = {};
+	vk::MemoryPropertyFlags property           = {};
+	vk::MemoryPropertyFlags preferred_property = {};
+	VmaAllocation           allocation         = nullptr;
+	uint32_t                type               = 0;
 };
 
 struct VulkanImageState {
@@ -125,6 +140,7 @@ struct VulkanImage {
 	vk::Format                    format      = vk::Format::eUndefined;
 	vk::ImageType                 image_type  = vk::ImageType::e2D;
 	vk::Extent3D                  extent      = {1, 1, 1};
+	uint32_t                      guest_pitch = 0;
 	uint32_t                      layers      = 1;
 	uint32_t                      mip_levels  = 1;
 	uint32_t                      samples     = 1;
@@ -133,10 +149,15 @@ struct VulkanImage {
 	vk::Image                     image       = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
-	VmaAllocation                allocation = nullptr;
+	Graphics::VulkanMemory        memory;
 };
 
-
+struct VulkanBuffer {
+	vk::Buffer           buffer = nullptr;
+	VulkanMemory         memory;
+	vk::BufferUsageFlags usage       = {};
+	uint64_t             buffer_size = 0;
+};
 
 } // namespace Libs::Graphics
 

@@ -18,11 +18,36 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vma.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 
 namespace Libs::Graphics {
+
+namespace {
+
+struct MemoryStats {
+	std::atomic_uint64_t allocated[VK_MAX_MEMORY_TYPES] {};
+	std::atomic_uint64_t count[VK_MAX_MEMORY_TYPES] {};
+};
+
+MemoryStats g_memory_stats;
+
+} // namespace
+
+void VulkanTrackAllocation(const VulkanMemory& memory) {
+	g_memory_stats.allocated[memory.type] += memory.requirements.size;
+	g_memory_stats.count[memory.type]++;
+}
+
+void VulkanUntrackAllocation(const VulkanMemory& memory) {
+	EXIT_IF(g_memory_stats.allocated[memory.type] < memory.requirements.size);
+	EXIT_IF(g_memory_stats.count[memory.type] == 0);
+	g_memory_stats.allocated[memory.type] -= memory.requirements.size;
+	g_memory_stats.count[memory.type]--;
+}
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -130,42 +155,40 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+	EXIT_IF(allocator == nullptr || image.image != nullptr || image.memory.allocation != nullptr);
 
+	auto&                   memory = image.memory;
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	alloc_info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory.property);
+	alloc_info.preferredFlags =
+	    static_cast<vk::MemoryPropertyFlags::MaskType>(memory.preferred_property);
 
+	VmaAllocationInfo allocation_result {};
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	                   &alloc_info, &native_image, &memory.allocation, &allocation_result));
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;
 	}
 
-	image.format     = image_info.format;
-	image.image_type = image_info.imageType;
-	image.extent     = image_info.extent;
-	image.layers     = image_info.arrayLayers;
-	image.mip_levels = image_info.mipLevels;
-	image.samples    = static_cast<uint32_t>(image_info.samples);
-	image.usage      = image_info.usage;
-	image.flags      = image_info.flags;
-	image.state      = {.layout = image_info.initialLayout};
-	image.subresource_states.clear();
-
+	device.getImageMemoryRequirements(image.image, &memory.requirements);
+	memory.type = allocation_result.memoryType;
+	VulkanTrackAllocation(memory);
 	return true;
 }
 
 void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
+	EXIT_IF(allocator == nullptr || image.image == nullptr || image.memory.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
-	image.image      = nullptr;
-	image.allocation = nullptr;
+	auto& memory = image.memory;
+	VulkanUntrackAllocation(memory);
+	vmaDestroyImage(allocator, image.image, memory.allocation);
+	image.image            = nullptr;
+	memory.allocation      = nullptr;
 }
 
 } // namespace Libs::Graphics
