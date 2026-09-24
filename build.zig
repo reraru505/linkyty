@@ -138,7 +138,7 @@ pub fn build(b: *std.Build) void {
     }.add;
 
     // -------------------------------------------------------------------------
-    // Target 1: kyty_emulator (Main Executable)
+    // Target 1: linkyty (Main Executable)
     // -------------------------------------------------------------------------
     const emulator_mod = b.createModule(.{
         .target = target,
@@ -152,7 +152,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const emulator_exe = b.addExecutable(.{
-        .name = "kyty_emulator",
+        .name = "linkyty",
         .root_module = emulator_mod,
     });
 
@@ -165,7 +165,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_emulator_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run the kyty_emulator executable");
+    const run_step = b.step("run", "Run the linkyty executable");
     run_step.dependOn(&run_emulator_cmd.step);
 
     // -------------------------------------------------------------------------

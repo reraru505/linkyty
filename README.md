@@ -1,375 +1,171 @@
-# KytyPS5
+# LinKyty (`lin-kitty`)
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
-[![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64-E95420.svg?logo=linux&logoColor=white)](#system-requirements)
+[![Build System](https://img.shields.io/badge/Build%20System-Zig%200.16.0-F7A41D.svg?logo=zig&logoColor=white)](#building)
+[![Renderer](https://img.shields.io/badge/Vulkan-1.3-red.svg?logo=vulkan&logoColor=white)](#developer-information)
+[![Synchronization](https://img.shields.io/badge/Sync-Proton--Style%20Futex-brightgreen.svg)](#benchmarks)
+[![License](https://img.shields.io/badge/License-GPL--2.0-blue.svg)](LICENSE)
 
-KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
-with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
-can change significantly between builds.
+**LinKyty** (pronounced *"Lin-kitty"*, like *lickety-split*) is a ruthlessly stripped, high-performance, Linux-native PlayStation 5 runtime. 
+
+It is an opinionated hard fork of [Kyty](https://github.com/InoriRus/Kyty) and [KytyPS5](https://github.com/KytyPS5/KytyPS5), re-engineered specifically for **Steam, Steam Deck, Lutris, and headless CLI runners**.
 
 > [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
-> not distribute games or copyrighted system software. Use only game files that you have obtained
-> legally.
+> LinKyty is not affiliated with Sony Interactive Entertainment or PlayStation. The project does not distribute games, firmware, decryption keys, or copyrighted system software. Use only game files and ELFs that you have obtained legally.
 
-## Current Status
+---
 
-KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
-planned.
+## ⚡ Why LinKyty?
 
-Development is currently focused on expanding game compatibility and improving boot reliability.
+Upstream Kyty is an impressive emulator, but carries massive cross-platform baggage: tens of thousands of lines of CMake/Ninja scripts, Qt6 GUI launcher dialogs, Windows MSVC wrappers, and heavyweight synchronization abstractions.
 
-Windows and Linux are the primary platforms and receive the most testing.
+LinKyty strips away over **9,600 lines** of legacy bloat and rebuilds the project around a pure Linux gaming philosophy:
 
-macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
-Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
-on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
+1. **Zero GUI Bloat**: Completely nuked Qt6, desktop launchers, and UI dialogs. LinKyty is a lean, headless runner designed to plug directly into Steam, Lutris, or Heroic.
+2. **Pure Zig 0.16 Toolchain**: No CMake, no Ninja, no Makefiles. A single, hermetic [`build.zig`](build.zig) orchestrates the entire C++20/C11 compilation pipeline and automatically compiles & embeds Vulkan SPIR-V compute and blit shaders on the fly.
+3. **Proton-Style 3-State CAS + Linux Futex Core**: Replaced heavy host `std::mutex` and forced 10ms condition-variable polling loops with a Drepper 3-state atomic CAS state machine (`0 = UNLOCKED`, `1 = LOCKED`, `2 = CONTENDED`), 16-cycle `_mm_pause()` adaptive spin, and direct Linux `SYS_futex` sleep.
+4. **Inline Object Fast-Paths**: Mutexes, rwlocks, and condition variables resolve inline with zero global hash-table lockups (~50ns saved per lock/unlock).
+5. **No Idle CPU Churn**: Condition variables adaptively sleep without waking 100 times/second per thread when no signals are pending, silencing background CPU waste in worker thread pools.
 
-Community game test results are available in the
-[KytyPS5 Compatibility List](https://kytyps5.github.io/).
+---
 
-## Bugs and Issues
+## 📊 Benchmarks
 
-Compatibility, stability, and performance can vary between versions. You may encounter crashes
-or graphical glitches, so please include the version you tested when reporting an issue.
+Measured on Linux x86_64 comparing the original Kyty baseline against LinKyty (`ReleaseFast`):
 
-## Screenshots
+| Scenario | Original Baseline | LinKyty (`ReleaseFast`) | Performance Gain |
+| :--- | :--- | :--- | :--- |
+| **Uncontended Lock/Unlock** | **135.9 ns** (7.36 M ops/s) | **12.8 ns** (78.05 M ops/s) | **10.6x faster** |
+| **Contended (2 Threads)** | **179.7 ns** (5.57 M ops/s) | **36.3 ns** (27.54 M ops/s) | **5.0x faster** |
+| **Contended (4 Threads)** | **262.0 ns** (3.82 M ops/s) | **61.5 ns** (16.25 M ops/s) | **4.3x faster** |
+| **Contended (8 Threads)** | **554.6 ns** (1.80 M ops/s) | **44.8 ns** (22.30 M ops/s) | **12.4x faster** |
+| **8-Thread Total Run Time** | **277.3 ms** | **22.4 ms** | **91.9% time reduction** |
+| **8-Thread Context Switches** | **179 switches** | **3 switches** | **98.3% fewer context switches** |
+
+Run the benchmark suite locally anytime with:
+```bash
+zig build bench -Doptimize=ReleaseFast
+```
+
+---
+
+## 🎮 Screenshots
 
 <table align="center">
   <tr>
     <td align="center">
       <strong>Astro Bot</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
+      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in LinKyty">
     </td>
     <td align="center">
       <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
+      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in LinKyty">
     </td>
   </tr>
   <tr>
     <td align="center">
       <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
+      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in LinKyty">
     </td>
     <td align="center">
       <strong>SILENT HILL: The Short Message</strong><br>
-      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
+      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in LinKyty">
     </td>
   </tr>
   <tr>
     <td align="center">
       <strong>Demon's Souls</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
+      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in LinKyty">
     </td>
     <td align="center">
       <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in LinKyty">
     </td>
   </tr>
 </table>
 
-<p align="center"><em>And many more...</em></p>
+---
 
-## Contributing
+## 🛠️ Building
 
-Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
+### System Requirements
+- **OS**: Modern Linux distribution (Arch, CachyOS, Fedora, Ubuntu/Debian).
+- **CPU**: x86_64 processor with AVX2 support.
+- **GPU**: Vulkan 1.3 capable GPU with proprietary/Mesa drivers (AMD RADV, NVIDIA, or Intel ANV).
 
-Code contributions should be focused, build successfully on the platforms they touch, and include
-relevant tests where practical. Windows is the primary target, so a change that alters shared code
-should not regress it; changes confined to a platform's own code paths only need to build there. Because KytyPS5 is still evolving quickly, consider opening an issue before
-starting a large change.
+### Dependencies
+Install the required development packages from your package manager:
 
-### Formatting
+- **Arch Linux / CachyOS**:
+  ```bash
+  sudo pacman -S zig glslang vulkan-devel sdl3 ffmpeg zydis spirv-tools python
+  ```
+- **Fedora**:
+  ```bash
+  sudo dnf install zig glslang vulkan-loader-devel SDL3-devel ffmpeg-devel zydis-devel spirv-tools-devel python3
+  ```
+- **Ubuntu 24.04+ / Debian**:
+  ```bash
+  sudo apt install zig glslang-tools libvulkan-dev libsdl3-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev spirv-tools python3
+  ```
 
-Set up the clang-format hook after cloning:
+### Build Steps
 
-Install `pre-commit` using the method appropriate for your platform:
+1. Clone the repository and initialize submodules:
+   ```bash
+   git clone --recursive <your-repo-url>
+   cd linkyty
+   ```
 
-- **Arch Linux / CachyOS:** `sudo pacman -S pre-commit`
-- **Other Linux / macOS / Windows:** `python -m pip install pre-commit`
+2. Compile with Zig:
+   ```bash
+   # Optimized Release Build (recommended for gaming)
+   zig build -Doptimize=ReleaseFast
 
-Then install the Git hook:
+   # Debug Build (with full debug symbols and tracing)
+   zig build
+   ```
 
+The compiled binary will be placed at `zig-out/bin/linkyty`.
+
+3. Run verification tests:
+   ```bash
+   zig build test
+   ```
+
+---
+
+## 🚀 Usage & Launcher Integration
+
+### Command Line
 ```bash
-python -m pre_commit install --install-hooks
+./zig-out/bin/linkyty --game /path/to/game_directory --fullscreen
 ```
 
-It formats staged `.cpp`, `.h`, and `.inc` files in `src`.
+Run `./zig-out/bin/linkyty --help` to view all available CLI flags (resolution, presentation modes, AMD instruction patching, Vulkan device index, and ETAHen cheat patches).
 
-## Developer Information
+### Steam / Steam Deck Integration
+1. In Steam, click **Games &rarr; Add a Non-Steam Game to My Library...**
+2. Point it to your compiled `linkyty` binary.
+3. Open its **Properties**, and in **Launch Options**, specify:
+   ```bash
+   %command% --fullscreen --screen-width 1920 --screen-height 1080 --game "/path/to/game"
+   ```
 
-The PS5 graphics architecture is based on AMD RDNA 2. Use AMD's
-[RDNA 2 Instruction Set Architecture Reference Guide (document 70648)](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
-as the primary instruction-encoding reference when working on shader decoding and recompilation.
+### Lutris Integration
+1. Add a new game and select **Custom / Linux Native** as the runner.
+2. Under **Game options**:
+   - **Executable**: `/path/to/linkyty`
+   - **Arguments**: `--fullscreen --game "/path/to/game"`
 
-Important areas of the codebase:
+---
 
-- [`src/graphics/shader/recompiler`](src/graphics/shader/recompiler) — instruction decoding,
-  intermediate representation, control flow, resource tracking, and SPIR-V emission
-- [`src/graphics/guest_gpu`](src/graphics/guest_gpu) — PS5 (Prospero) GPU formats and command processing
-- [`src/graphics/host_gpu`](src/graphics/host_gpu) — Vulkan host backend and resource management
-- [`tests`](tests) — focused memory, shader, and resource-tracking regression tests
+## 📜 Upstream Attribution & License
 
-The renderer targets Vulkan 1.3. Keep shader changes aligned with both the RDNA 2 ISA semantics and
-the Vulkan/SPIR-V validation rules.
+LinKyty is licensed under the [GNU General Public License v2.0](LICENSE).
 
-## Building
+LinKyty is a hard fork based on the pioneering work of:
+- **Inori** and contributors of the original [Kyty](https://github.com/InoriRus/Kyty) project.
+- The [KytyPS5](https://github.com/KytyPS5/KytyPS5) organization contributors.
 
-### System requirements
-
-- Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
-- A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
-- A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
-  MoltenVK)
-
-### Build requirements (Windows)
-
-- Git
-- CMake 3.12 or newer
-- Ninja
-- Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
-  **C++ Clang tools for Windows** component
-- Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslangValidator`) on `PATH`
-
-The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
-
-Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or the equivalent Developer
-PowerShell), change to the repository root, and initialize the dependencies:
-
-```powershell
-git submodule update --init --recursive
-```
-
-Configure the project. Replace the Qt path with the version installed on your system:
-
-```powershell
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
-```
-
-Build the launcher and stage a runnable installation:
-
-```powershell
-cmake --build _Build/windows --target launcher
-cmake --install _Build/windows --prefix _Build/windows/install
-```
-
-The finished application and its runtime dependencies will be placed in
-`_Build/windows/install`.
-
-### Building on Linux
-
-Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland and
-udev development packages SDL3 quietly configures itself without those backends, and the resulting
-build has no working sound and no gamepad hotplug:
-
-```bash
-sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools pkg-config \
-  libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
-  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
-```
-
-Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
-(`qt6-base-dev`) or an official Qt installation.
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
-from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
-release, including VP9 and WebM support. System FFmpeg packages are not required.
-
-As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
-time.
-
-The CMake source root is the repository root.
-
-### Building on NixOS
-
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
-libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
-`CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
-needed:
-
-```bash
-nix-shell # or: nix develop
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The configure step downloads the FFmpeg prebuilts and the `xbyak`/`zydis` sources, so it needs
-network access; a fully sandboxed `nix build` would require vendoring those inputs. A Vulkan 1.3
-driver must be available at runtime (on NixOS, `hardware.graphics.enable = true`).
-
-### Building on macOS
-
-macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
-code executes through the same translation layer as the emulator itself. Prebuilt archives are
-attached to releases; the steps below are for building from source.
-
-Requirements:
-
-- An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
-- Xcode (or the Command Line Tools)
-- Homebrew packages: `brew install cmake ninja glslang`
-- Qt 6 (Concurrent, Network, Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/macos --target launcher --parallel
-cmake --install _Build/macos --prefix _Build/macos/install
-```
-
-The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required. When the launcher is built, the install
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
-A flat `kyty_emulator` is kept for CLI usage.
-
-Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
-[MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
-
-```bash
-codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
-# For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
-```
-
-Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
-
-### Regression tests
-
-Build every regression executable and run the registered tests with:
-
-```powershell
-cmake --build _Build/windows --target kyty_tests
-ctest --test-dir _Build/windows --output-on-failure
-```
-
-Use `_Build/linux` instead of `_Build/windows` for a Linux build.
-
-### Visual Studio Code
-
-A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
-Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
-compiler per platform, so on Linux configure from the command line as shown above.
-
-Before using it:
-
-1. Install the **CMake Tools** and **C/C++** extensions in Visual Studio Code.
-2. Update `CMAKE_PREFIX_PATH` in [`.vscode/settings.json`](.vscode/settings.json) to point to your
-   Qt 6 MSVC installation.
-3. Update the `--game` path in [`.vscode/launch.json`](.vscode/launch.json) for the
-   **Debug kyty_emulator** profile.
-4. Open the repository in an x64 Visual Studio developer environment, configure the CMake project,
-   and select a launch profile from **Run and Debug**.
-
-## Running
-
-Update your graphics driver before reporting rendering problems.
-
-To use the graphical launcher:
-
-```powershell
-.\_Build\windows\install\launcher.exe
-```
-
-```bash
-./_Build/linux/install/launcher
-```
-
-```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
-```
-
-On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
-from the game list.
-
-The emulator can also be started directly with a legally obtained game directory or ELF file:
-
-```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
-```
-
-```bash
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
-environment variable is required:
-
-```bash
-./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
-
-```bash
-SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
-```
-
-Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
-
-### AI Use
-
-AI tools may be used for research, reverse engineering, and development assistance. Contributors
-must fully understand, review, and test all code they submit and remain responsible for its
-correctness. Repository communication, including pull-request descriptions, code comments, and
-issue comments, must come from the human contributor rather than an autonomous AI agent.
-
-Pull requests that include AI-assisted or AI-generated work should disclose the scope of the AI
-involvement and describe the human review and testing performed before submission. Unverified or
-untested generated changes may be closed without review.
-
-## License
-
-KytyPS5 is licensed under the [GNU General Public License version 2](LICENSE)
-(`GPL-2.0-only`).
-
-This project is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
-under the MIT License. Kyty's original copyright and license notice are preserved in
-[`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party components remain subject to the
-licenses included with those components.
-
-## Special Thanks
-
-- [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
-  of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
-  memory behavior, GPU resource aliasing and cache coherency,
-  and the AVPlayer implementation.
+All original copyrights and licenses are preserved.

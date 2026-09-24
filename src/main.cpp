@@ -40,7 +40,7 @@ static std::string GetBuildString() {
 
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
+	::printf("linkyty --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
