@@ -25,9 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
-#include <limits>
 #include <span>
-#include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/libspirv.h>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -150,25 +149,41 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
-	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
-	std::string          messages;
-	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
-	                                     const spv_position_t& position, const char* message) {
-		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
-		                        static_cast<int>(position.column), static_cast<int>(position.index),
-		                        message);
-	});
-	if (tools.Validate(spirv)) {
+	spv_context ctx = spvContextCreate(SPV_ENV_VULKAN_1_3);
+	if (!ctx) {
 		return true;
 	}
-	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
-	std::string          text;
-	disassembler.Disassemble(spirv, &text,
-	                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
+	spv_diagnostic diag = nullptr;
+	spv_result_t   res  = spvValidateBinary(ctx, spirv.data(), spirv.size(), &diag);
+	if (res == SPV_SUCCESS) {
+		spvDiagnosticDestroy(diag);
+		spvContextDestroy(ctx);
+		return true;
+	}
+	std::string messages = (diag && diag->error) ? diag->error : "Unknown validation error";
+	spvDiagnosticDestroy(diag);
+	spvContextDestroy(ctx);
+
+	spv_context dis_ctx = spvContextCreate(SPV_ENV_VULKAN_1_2);
+	std::string text;
+	if (dis_ctx) {
+		spv_text       dis_text = nullptr;
+		spv_diagnostic dis_diag = nullptr;
+		uint32_t       dis_options =
+		    static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
+		    static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
+		    static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
+		    static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
+		    static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR);
+		if (spvBinaryToText(dis_ctx, spirv.data(), spirv.size(), dis_options, &dis_text,
+		                    &dis_diag) == SPV_SUCCESS &&
+		    dis_text != nullptr) {
+			text.assign(dis_text->str, dis_text->length);
+			spvTextDestroy(dis_text);
+		}
+		spvDiagnosticDestroy(dis_diag);
+		spvContextDestroy(dis_ctx);
+	}
 	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
 	           label, shader_hash, messages.c_str());
 	LOGF("%s\n", text.c_str());

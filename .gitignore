@@ -6,3 +6,7 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+.zig-cache/
+zig-out/
+src/generated/
+3rdparty/SDL2/

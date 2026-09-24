@@ -52,6 +52,7 @@
 #include <fmt/format.h>
 #include <pthread_time.h>
 #elif !defined(__APPLE__)
+#include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -342,15 +343,20 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 }
 #endif
 
+enum MutexState : uint32_t {
+	MUTEX_UNLOCKED  = 0,
+	MUTEX_LOCKED    = 1,
+	MUTEX_CONTENDED = 2,
+};
+
 struct PthreadMutexPrivate {
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	std::condition_variable cv;
-	Pthread                 owner     = nullptr;
-	uint32_t                count     = 0;
-	int                     type      = 1;
-	int                     pprotocol = PTHREAD_PRIO_NONE;
+	uint8_t               reserved[256];
+	std::string           name;
+	std::atomic<uint32_t> state {MUTEX_UNLOCKED};
+	std::atomic<Pthread>  owner {nullptr};
+	uint32_t              count     = 0;
+	int                   type      = 1;
+	int                   pprotocol = PTHREAD_PRIO_NONE;
 };
 
 struct PthreadMutexattrPrivate {
@@ -436,7 +442,9 @@ struct PthreadRwlockPrivate {
 	uint32_t                writer_count    = 0;
 	uint32_t                reader_count    = 0;
 	uint32_t                waiting_writers = 0;
-	std::vector<Reader>     readers;
+	std::array<Reader, 8>   inline_readers {};
+	uint32_t                num_inline_readers = 0;
+	std::vector<Reader>     overflow_readers;
 };
 
 struct PthreadRwlockattrPrivate {
@@ -1253,15 +1261,104 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+static int NativeMutexLockContended(PthreadMutexPrivate* mutex, Pthread self, KernelUseconds* timeout_us) {
+	uint32_t current_state = mutex->state.load(std::memory_order_relaxed);
+	while (current_state == MUTEX_LOCKED) {
+		if (mutex->state.compare_exchange_weak(current_state, MUTEX_CONTENDED,
+		                                       std::memory_order_relaxed,
+		                                       std::memory_order_relaxed)) {
+			current_state = MUTEX_CONTENDED;
+			break;
+		}
+	}
+
+	const bool has_timeout = (timeout_us != nullptr);
+	const auto deadline = has_timeout
+	    ? (std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us))
+	    : std::chrono::steady_clock::time_point::max();
+
+	while (true) {
+		if (current_state == MUTEX_UNLOCKED) {
+			uint32_t expected = MUTEX_UNLOCKED;
+			if (mutex->state.compare_exchange_strong(expected, MUTEX_CONTENDED,
+			                                         std::memory_order_acquire,
+			                                         std::memory_order_relaxed)) {
+				mutex->owner.store(self, std::memory_order_relaxed);
+				mutex->count = 1;
+				return OK;
+			}
+			current_state = expected;
+			continue;
+		}
+
+		struct timespec  ts {};
+		struct timespec* ts_ptr = nullptr;
+
+		if (has_timeout) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) {
+				return ETIMEDOUT;
+			}
+			const auto rem_us = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+			const auto wait_us = (self->pending_signal_mask.load(std::memory_order_relaxed) != 0)
+			    ? std::min<int64_t>(rem_us, SIGNAL_APC_POLL_MICROS)
+			    : rem_us;
+			ts.tv_sec  = wait_us / 1000000;
+			ts.tv_nsec = (wait_us % 1000000) * 1000;
+			ts_ptr     = &ts;
+		} else if (self->pending_signal_mask.load(std::memory_order_relaxed) != 0) {
+			ts.tv_sec  = 0;
+			ts.tv_nsec = SIGNAL_APC_POLL_MICROS * 1000;
+			ts_ptr     = &ts;
+		}
+
+		syscall(SYS_futex, reinterpret_cast<uint32_t*>(&mutex->state),
+		        FUTEX_WAIT_PRIVATE, MUTEX_CONTENDED, ts_ptr, nullptr, 0);
+
+		if (self->pending_signal_mask.load(std::memory_order_relaxed) != 0) {
+			KernelDispatchPendingSignalForCurrentThread();
+		}
+
+		if (has_timeout && std::chrono::steady_clock::now() >= deadline) {
+			uint32_t exp = MUTEX_UNLOCKED;
+			if (mutex->state.compare_exchange_strong(exp, MUTEX_CONTENDED,
+			                                         std::memory_order_acquire,
+			                                         std::memory_order_relaxed)) {
+				mutex->owner.store(self, std::memory_order_relaxed);
+				mutex->count = 1;
+				return OK;
+			}
+			return ETIMEDOUT;
+		}
+
+		current_state = mutex->state.load(std::memory_order_relaxed);
+		if (current_state == MUTEX_LOCKED) {
+			mutex->state.compare_exchange_strong(current_state, MUTEX_CONTENDED,
+			                                     std::memory_order_relaxed,
+			                                     std::memory_order_relaxed);
+			current_state = MUTEX_CONTENDED;
+		}
+	}
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
 	auto* self = g_pthread_self;
 	EXIT_NOT_IMPLEMENTED(self == nullptr);
 
-	std::unique_lock lock(mutex->m);
+	// 1. Fast Path: Uncontended atomic CAS (0 -> 1)
+	uint32_t expected = MUTEX_UNLOCKED;
+	if (mutex->state.compare_exchange_strong(expected, MUTEX_LOCKED,
+	                                         std::memory_order_acquire,
+	                                         std::memory_order_relaxed)) {
+		mutex->owner.store(self, std::memory_order_relaxed);
+		mutex->count = 1;
+		return OK;
+	}
 
-	if (mutex->owner == self) {
+	// 2. Recursive lock check
+	if (mutex->owner.load(std::memory_order_relaxed) == self) {
 		if (mutex->type == 2) {
 			if (mutex->count == UINT32_MAX) {
 				return EAGAIN;
@@ -1271,52 +1368,35 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		}
 		if (timeout_us != nullptr) {
 			if (*timeout_us > 0) {
-				mutex->cv.wait_for(lock, std::chrono::microseconds(*timeout_us));
+				Common::Thread::SleepMicro(*timeout_us);
 			}
 			return ETIMEDOUT;
 		}
 		return EDEADLK;
 	}
 
-	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
-	} else if (*timeout_us == 0) {
-		if (mutex->owner != nullptr) {
-			return ETIMEDOUT;
-		}
-	} else {
-		const auto deadline =
-		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
-		while (mutex->owner != nullptr) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				return ETIMEDOUT;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			mutex->cv.wait_for(lock, poll);
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
-		}
+	// Zero timeout means non-blocking trylock
+	if (timeout_us != nullptr && *timeout_us == 0) {
+		return ETIMEDOUT;
 	}
 
-	mutex->owner = self;
-	mutex->count = 1;
-	return OK;
+	// 3. Adaptive spin: brief pause loop to absorb immediate lock handover
+	for (int spin = 0; spin < 16; spin++) {
+		expected = MUTEX_UNLOCKED;
+		if (mutex->state.compare_exchange_weak(expected, MUTEX_LOCKED,
+		                                       std::memory_order_acquire,
+		                                       std::memory_order_relaxed)) {
+			mutex->owner.store(self, std::memory_order_relaxed);
+			mutex->count = 1;
+			return OK;
+		}
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#endif
+	}
+
+	// 4. Contended slow path via Linux SYS_futex
+	return NativeMutexLockContended(mutex, self, timeout_us);
 }
 
 static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
@@ -1325,9 +1405,7 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 	auto* self = g_pthread_self;
 	EXIT_NOT_IMPLEMENTED(self == nullptr);
 
-	std::unique_lock lock(mutex->m);
-
-	if (mutex->owner == self) {
+	if (mutex->owner.load(std::memory_order_relaxed) == self) {
 		if (mutex->type == 2) {
 			if (mutex->count == UINT32_MAX) {
 				return EAGAIN;
@@ -1338,13 +1416,16 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 		return EBUSY;
 	}
 
-	if (mutex->owner != nullptr) {
-		return EBUSY;
+	uint32_t expected = MUTEX_UNLOCKED;
+	if (mutex->state.compare_exchange_strong(expected, MUTEX_LOCKED,
+	                                         std::memory_order_acquire,
+	                                         std::memory_order_relaxed)) {
+		mutex->owner.store(self, std::memory_order_relaxed);
+		mutex->count = 1;
+		return OK;
 	}
 
-	mutex->owner = self;
-	mutex->count = 1;
-	return OK;
+	return EBUSY;
 }
 
 static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nullptr) {
@@ -1353,9 +1434,7 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 	auto* self = g_pthread_self;
 	EXIT_NOT_IMPLEMENTED(self == nullptr);
 
-	std::unique_lock lock(mutex->m);
-
-	if (mutex->owner != self) {
+	if (mutex->owner.load(std::memory_order_relaxed) != self) {
 		return EPERM;
 	}
 
@@ -1369,10 +1448,16 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 		return OK;
 	}
 
-	mutex->owner = nullptr;
+	mutex->owner.store(nullptr, std::memory_order_relaxed);
 	mutex->count = 0;
-	lock.unlock();
-	mutex->cv.notify_one();
+
+	// Fast Path Unlock: atomic exchange to MUTEX_UNLOCKED (0)
+	uint32_t prev = mutex->state.exchange(MUTEX_UNLOCKED, std::memory_order_release);
+	if (prev == MUTEX_CONTENDED) {
+		// Wake exactly 1 waiter sleeping on Linux SYS_futex
+		syscall(SYS_futex, reinterpret_cast<uint32_t*>(&mutex->state),
+		        FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+	}
 
 	return OK;
 }
@@ -1382,7 +1467,6 @@ static int NativeMutexLockRecurse(PthreadMutexPrivate* mutex, uint32_t recurse) 
 
 	int result = NativeMutexLock(mutex, nullptr);
 	if (result == OK) {
-		std::lock_guard lock(mutex->m);
 		mutex->count = std::max<uint32_t>(recurse, 1);
 	}
 	return result;
@@ -1720,7 +1804,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = ((*mutex)->owner == nullptr ? 0 : EBUSY);
+	int result = ((*mutex)->owner.load(std::memory_order_relaxed) == nullptr ? 0 : EBUSY);
 
 	if (result != 0) {
 		LOGF("\tmutex destroy: %s, %d\n", (*mutex)->name.c_str(), result);
@@ -1742,23 +1826,64 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 	}
 }
 
-int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
+static inline PthreadMutexPrivate* ResolveMutex(PthreadMutex* mutex) {
 	if (mutex == nullptr) {
+		return nullptr;
+	}
+	auto* m = *mutex;
+	if (m == nullptr || reinterpret_cast<uintptr_t>(m) <= 4) {
+		auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+		mutex = static_cast<PthreadMutex*>(
+		    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
+		if (mutex == nullptr) {
+			return nullptr;
+		}
+		m = *mutex;
+	}
+	return m;
+}
+
+static inline PthreadRwlockPrivate* ResolveRwlock(PthreadRwlock* rwlock) {
+	if (rwlock == nullptr) {
+		return nullptr;
+	}
+	auto* r = *rwlock;
+	if (r == nullptr) {
+		auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+		rwlock = static_cast<PthreadRwlock*>(
+		    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
+		if (rwlock == nullptr) {
+			return nullptr;
+		}
+		r = *rwlock;
+	}
+	return r;
+}
+
+static inline PthreadCondPrivate* ResolveCond(PthreadCond* cond) {
+	if (cond == nullptr) {
+		return nullptr;
+	}
+	auto* c = *cond;
+	if (c == nullptr) {
+		auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+		cond = static_cast<PthreadCond*>(
+		    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
+		if (cond == nullptr) {
+			return nullptr;
+		}
+		c = *cond;
+	}
+	return c;
+}
+
+int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	auto* m = ResolveMutex(mutex);
+	if (m == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	int result = NativeMutexLock(*mutex, nullptr);
-
-	// LOGF("\tmutex lock: %s, %d\n", (*mutex)->name.c_str(), result);
+	int result = NativeMutexLock(m, nullptr);
 
 	switch (result) {
 		case 0: return OK;
@@ -1770,22 +1895,12 @@ int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
-	if (mutex == nullptr) {
+	auto* m = ResolveMutex(mutex);
+	if (m == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	int result = NativeMutexTrylock(*mutex);
-
-	// LOGF("\tmutex trylock: %s, %d\n", (*mutex)->name.c_str(), result);
+	int result = NativeMutexTrylock(m);
 
 	switch (result) {
 		case 0: return OK;
@@ -1797,20 +1912,12 @@ int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
-	if (mutex == nullptr) {
+	auto* m = ResolveMutex(mutex);
+	if (m == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	int result = NativeMutexLock(*mutex, &usec);
+	int result = NativeMutexLock(m, &usec);
 
 	switch (result) {
 		case 0: return OK;
@@ -1823,29 +1930,20 @@ int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec
 }
 
 int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
-	if (mutex == nullptr) {
+	auto* m = ResolveMutex(mutex);
+	if (m == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	int result = NativeMutexUnlock(*mutex);
+	int result = NativeMutexUnlock(m);
 
 	if (result != 0) {
-		LOGF("\tmutex unlock: %s, %d, thread_id = %d\n", (*mutex)->name.c_str(), result,
+		LOGF("\tmutex unlock: %s, %d, thread_id = %d\n", m->name.c_str(), result,
 		     Common::Thread::GetThreadIdUnique());
 	}
 
 	switch (result) {
 		case 0: return OK;
-
 		case EINVAL: return KERNEL_ERROR_EINVAL;
 		case EPERM: return KERNEL_ERROR_EPERM;
 		default: return KERNEL_ERROR_EINVAL;
@@ -2308,10 +2406,15 @@ int KYTY_SYSV_ABI PthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockat
 	return PthreadRwlockInitNamed(rwlock, attr, name);
 }
 
-static PthreadRwlockPrivate::Reader* RwlockFindReader(PthreadRwlock rwlock, Pthread thread) {
+static PthreadRwlockPrivate::Reader* RwlockFindReader(PthreadRwlockPrivate* rwlock, Pthread thread) {
 	EXIT_IF(rwlock == nullptr);
 
-	for (auto& reader: rwlock->readers) {
+	for (uint32_t i = 0; i < rwlock->num_inline_readers; ++i) {
+		if (rwlock->inline_readers[i].thread == thread) {
+			return &rwlock->inline_readers[i];
+		}
+	}
+	for (auto& reader: rwlock->overflow_readers) {
 		if (reader.thread == thread) {
 			return &reader;
 		}
@@ -2320,22 +2423,34 @@ static PthreadRwlockPrivate::Reader* RwlockFindReader(PthreadRwlock rwlock, Pthr
 	return nullptr;
 }
 
-static void RwlockAddReader(PthreadRwlock rwlock, Pthread thread) {
+static void RwlockAddReader(PthreadRwlockPrivate* rwlock, Pthread thread) {
 	if (auto* reader = RwlockFindReader(rwlock, thread); reader != nullptr) {
 		reader->count++;
+	} else if (rwlock->num_inline_readers < rwlock->inline_readers.size()) {
+		rwlock->inline_readers[rwlock->num_inline_readers++] = {thread, 1};
 	} else {
-		rwlock->readers.push_back({thread, 1});
+		rwlock->overflow_readers.push_back({thread, 1});
 	}
 	rwlock->reader_count++;
 }
 
-static bool RwlockRemoveReader(PthreadRwlock rwlock, Pthread thread) {
-	for (auto it = rwlock->readers.begin(); it != rwlock->readers.end(); ++it) {
+static bool RwlockRemoveReader(PthreadRwlockPrivate* rwlock, Pthread thread) {
+	for (uint32_t i = 0; i < rwlock->num_inline_readers; ++i) {
+		if (rwlock->inline_readers[i].thread == thread) {
+			rwlock->inline_readers[i].count--;
+			rwlock->reader_count--;
+			if (rwlock->inline_readers[i].count == 0) {
+				rwlock->inline_readers[i] = rwlock->inline_readers[--rwlock->num_inline_readers];
+			}
+			return true;
+		}
+	}
+	for (auto it = rwlock->overflow_readers.begin(); it != rwlock->overflow_readers.end(); ++it) {
 		if (it->thread == thread) {
 			it->count--;
 			rwlock->reader_count--;
 			if (it->count == 0) {
-				rwlock->readers.erase(it);
+				rwlock->overflow_readers.erase(it);
 			}
 			return true;
 		}
@@ -2344,7 +2459,7 @@ static bool RwlockRemoveReader(PthreadRwlock rwlock, Pthread thread) {
 	return false;
 }
 
-static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUseconds* timeout_us) {
+static int RwlockLockCooperative(PthreadRwlockPrivate* rwlock, bool write, KernelUseconds* timeout_us) {
 	EXIT_IF(rwlock == nullptr);
 
 	auto* self = g_pthread_self;
@@ -2402,84 +2517,53 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 				}
 
 				const auto remaining = deadline - now;
-				const auto poll = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-				                       ? remaining
-				                       : std::chrono::steady_clock::duration(
-				                             std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+				const bool has_signal = (self->pending_signal_mask.load(std::memory_order_relaxed) != 0);
+				const auto poll = (has_signal && remaining > std::chrono::microseconds(SIGNAL_APC_POLL_MICROS))
+				                       ? std::chrono::steady_clock::duration(std::chrono::microseconds(SIGNAL_APC_POLL_MICROS))
+				                       : remaining;
 				rwlock->cv.wait_for(lock, poll);
-			} else {
+			} else if (self->pending_signal_mask.load(std::memory_order_relaxed) != 0) {
 				rwlock->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+			} else {
+				rwlock->cv.wait(lock);
 			}
 		}
 
-		KernelDispatchPendingSignalForCurrentThread();
+		if (self->pending_signal_mask.load(std::memory_order_relaxed) != 0) {
+			KernelDispatchPendingSignalForCurrentThread();
+		}
 	}
 }
 
 int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
-	// Hot path for some PS5 titles; per-call name logging can dominate runtime.
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	rwlock = static_cast<PthreadRwlock*>(
-	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
-
-	return RwlockLockCooperative(*rwlock, false, nullptr);
+	return RwlockLockCooperative(r, false, nullptr);
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec) {
-	PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	rwlock = static_cast<PthreadRwlock*>(
-	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
-
-	return RwlockLockCooperative(*rwlock, false, &usec);
+	return RwlockLockCooperative(r, false, &usec);
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec) {
-	PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	rwlock = static_cast<PthreadRwlock*>(
-	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
-
-	return RwlockLockCooperative(*rwlock, true, &usec);
+	return RwlockLockCooperative(r, true, &usec);
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
-	PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	rwlock = static_cast<PthreadRwlock*>(
-	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
 
 	auto* self = g_pthread_self;
 	if (self == nullptr) {
@@ -2487,11 +2571,11 @@ int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
-		const bool      already_reader = (RwlockFindReader(*rwlock, self) != nullptr);
-		if (((*rwlock)->writer == nullptr && ((*rwlock)->waiting_writers == 0 || already_reader)) ||
-		    (*rwlock)->writer == self) {
-			RwlockAddReader(*rwlock, self);
+		std::lock_guard lock(r->m);
+		const bool      already_reader = (RwlockFindReader(r, self) != nullptr);
+		if (((r->writer == nullptr && (r->waiting_writers == 0 || already_reader))) ||
+		    r->writer == self) {
+			RwlockAddReader(r, self);
 			return OK;
 		}
 	}
@@ -2500,13 +2584,10 @@ int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTrywrlock(PthreadRwlock* rwlock) {
-	PRINT_NAME();
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
 
 	auto* self = g_pthread_self;
 	if (self == nullptr) {
@@ -2514,13 +2595,13 @@ int KYTY_SYSV_ABI PthreadRwlockTrywrlock(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
-		if ((*rwlock)->writer == self || RwlockFindReader(*rwlock, self) != nullptr) {
+		std::lock_guard lock(r->m);
+		if (r->writer == self || RwlockFindReader(r, self) != nullptr) {
 			return KERNEL_ERROR_EDEADLK;
 		}
-		if ((*rwlock)->writer == nullptr && (*rwlock)->reader_count == 0) {
-			(*rwlock)->writer       = self;
-			(*rwlock)->writer_count = 1;
+		if (r->writer == nullptr && r->reader_count == 0) {
+			r->writer       = self;
+			r->writer_count = 1;
 			return OK;
 		}
 	}
@@ -2529,18 +2610,10 @@ int KYTY_SYSV_ABI PthreadRwlockTrywrlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	rwlock = static_cast<PthreadRwlock*>(
-	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
 
 	auto* self = g_pthread_self;
 	if (self == nullptr) {
@@ -2548,17 +2621,19 @@ int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
 	}
 
 	{
-		std::lock_guard lock((*rwlock)->m);
-		if (RwlockRemoveReader(*rwlock, self)) {
-			(*rwlock)->cv.notify_all();
+		std::lock_guard lock(r->m);
+		if (RwlockRemoveReader(r, self)) {
+			if (r->reader_count == 0 && r->waiting_writers > 0) {
+				r->cv.notify_all();
+			}
 			return OK;
 		}
-		if ((*rwlock)->writer == self) {
-			EXIT_IF((*rwlock)->writer_count == 0);
-			(*rwlock)->writer_count--;
-			if ((*rwlock)->writer_count == 0) {
-				(*rwlock)->writer = nullptr;
-				(*rwlock)->cv.notify_all();
+		if (r->writer == self) {
+			EXIT_IF(r->writer_count == 0);
+			r->writer_count--;
+			if (r->writer_count == 0) {
+				r->writer = nullptr;
+				r->cv.notify_all();
 			}
 			return OK;
 		}
@@ -2568,20 +2643,11 @@ int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockWrlock(PthreadRwlock* rwlock) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	rwlock = static_cast<PthreadRwlock*>(
-	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
-
-	if (rwlock == nullptr) {
+	auto* r = ResolveRwlock(rwlock);
+	if (r == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
-
-	return RwlockLockCooperative(*rwlock, true, nullptr);
+	return RwlockLockCooperative(r, true, nullptr);
 }
 
 int KYTY_SYSV_ABI PthreadRwlockattrDestroy(PthreadRwlockattr* attr) {
@@ -2716,25 +2782,20 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 }
 
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	cond = static_cast<PthreadCond*>(
-	    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
-
-	if (cond == nullptr) {
+	auto* c = ResolveCond(cond);
+	if (c == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
-
-	std::lock_guard lock((*cond)->m);
-	for (auto* thread: (*cond)->waiters) {
+	std::lock_guard lock(c->m);
+	if (c->waiters.empty()) {
+		return OK;
+	}
+	for (auto* thread: c->waiters) {
 		thread->cond_sequence++;
 		thread->cond_cv.notify_one();
 	}
-	(*cond)->waiters.clear();
+	c->waiters.clear();
 	return OK;
 }
 
@@ -2806,65 +2867,41 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 }
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	cond = static_cast<PthreadCond*>(
-	    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
-
-	if (cond == nullptr) {
+	auto* c = ResolveCond(cond);
+	if (c == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
-
-	std::lock_guard lock((*cond)->m);
-	CondWakeWaiter(*cond, nullptr);
+	std::lock_guard lock(c->m);
+	CondWakeWaiter(c, nullptr);
 	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
-	// PRINT_NAME();
-
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	cond = static_cast<PthreadCond*>(
-	    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
-
-	if (cond == nullptr || thread == nullptr) {
+	if (thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
+	auto* c = ResolveCond(cond);
+	if (c == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
-	std::lock_guard lock((*cond)->m);
-	CondWakeWaiter(*cond, thread);
+	std::lock_guard lock(c->m);
+	CondWakeWaiter(c, thread);
 	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
-	// PRINT_NAME();
+	auto* cond_value  = ResolveCond(cond);
+	auto* mutex_value = ResolveMutex(mutex);
 
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	cond = static_cast<PthreadCond*>(
-	    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
-	if (cond == nullptr || mutex == nullptr) {
+	if (cond_value == nullptr || mutex_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	auto* cond_value  = *cond;
-	auto* mutex_value = *mutex;
-
-	if (mutex_value->owner != g_pthread_self) {
+	if (mutex_value->owner.load(std::memory_order_relaxed) != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
 	}
 
@@ -2892,14 +2929,15 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 				break;
 			}
 
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+			const auto remaining  = deadline - now;
+			const bool has_signal = (thread->pending_signal_mask.load(std::memory_order_relaxed) != 0);
+			const auto poll       = (has_signal && remaining > std::chrono::microseconds(SIGNAL_APC_POLL_MICROS))
+			                            ? std::chrono::steady_clock::duration(
+			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS))
+			                            : remaining;
 			thread->cond_cv.wait_for(cond_lock, poll);
 
-			if (!ready()) {
+			if (!ready() && has_signal) {
 				cond_lock.unlock();
 				KernelDispatchPendingSignalForCurrentThread();
 				cond_lock.lock();
@@ -2916,8 +2954,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		result = lock_result;
 	}
 
-	// LOGF("\tcond timedwait: %s, %d\n", (*cond)->name.c_str(), result);
-
 	switch (result) {
 		case 0: return OK;
 		case ETIMEDOUT: return KERNEL_ERROR_ETIMEDOUT;
@@ -2929,31 +2965,19 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
-	// PRINT_NAME();
+	auto* cond_value  = ResolveCond(cond);
+	auto* mutex_value = ResolveMutex(mutex);
 
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	cond = static_cast<PthreadCond*>(
-	    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
-	if (cond == nullptr || mutex == nullptr) {
+	if (cond_value == nullptr || mutex_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	auto* cond_value  = *cond;
-	auto* mutex_value = *mutex;
 
 	std::chrono::steady_clock::time_point deadline {};
 	if (!NativeCondDeadlineFromAbs(cond_value->clock_id, abstime, &deadline)) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	if (mutex_value->owner != g_pthread_self) {
+	if (mutex_value->owner.load(std::memory_order_relaxed) != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
 	}
 
@@ -2977,14 +3001,15 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 			break;
 		}
 
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		const auto remaining  = deadline - now;
+		const bool has_signal = (thread->pending_signal_mask.load(std::memory_order_relaxed) != 0);
+		const auto poll       = (has_signal && remaining > std::chrono::microseconds(SIGNAL_APC_POLL_MICROS))
+		                            ? std::chrono::steady_clock::duration(
+			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS))
+		                            : remaining;
 		thread->cond_cv.wait_for(cond_lock, poll);
 
-		if (!ready()) {
+		if (!ready() && has_signal) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
 			cond_lock.lock();
@@ -3010,26 +3035,14 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
-	PRINT_NAME();
+	auto* cond_value  = ResolveCond(cond);
+	auto* mutex_value = ResolveMutex(mutex);
 
-	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
-
-	cond = static_cast<PthreadCond*>(
-	    pthread_static_objects->CreateObject(cond, PthreadStaticObject::Type::Cond));
-	mutex = static_cast<PthreadMutex*>(
-	    pthread_static_objects->CreateObject(mutex, PthreadStaticObject::Type::Mutex));
-
-	if (cond == nullptr || mutex == nullptr) {
+	if (cond_value == nullptr || mutex_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
-	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
-
-	auto* cond_value  = *cond;
-	auto* mutex_value = *mutex;
-
-	if (mutex_value->owner != g_pthread_self) {
+	if (mutex_value->owner.load(std::memory_order_relaxed) != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
 	}
 
@@ -3048,11 +3061,15 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
-		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
+		if (thread->pending_signal_mask.load(std::memory_order_relaxed) != 0) {
+			thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+			if (!ready()) {
+				cond_lock.unlock();
+				KernelDispatchPendingSignalForCurrentThread();
+				cond_lock.lock();
+			}
+		} else {
+			thread->cond_cv.wait(cond_lock);
 		}
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -3117,6 +3134,13 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 
 	const auto mask = 1ull << static_cast<uint32_t>(signum);
 	return (thread->pending_signal_mask.load(std::memory_order_acquire) & mask) != 0;
+}
+
+bool PthreadHasAnyPendingSignal(Pthread thread) {
+	if (thread == nullptr) {
+		return false;
+	}
+	return thread->pending_signal_mask.load(std::memory_order_relaxed) != 0;
 }
 
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
