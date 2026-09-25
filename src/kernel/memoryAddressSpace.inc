@@ -20,12 +20,6 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 	return candidate <= range_end && size <= range_end - candidate;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
-	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
-	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
-}
-#endif
 
 class GuestBackingStore {
 public:
@@ -163,15 +157,25 @@ public:
 			}
 		}
 
-		auto* destination = static_cast<uint8_t*>(data);
-		std::memset(destination, 0, size);
+		// Only the gaps between mappings read as zero. Zeroing the whole span first and then
+		// copying every mapping over it meant a fully backed read - the usual case for a GPU buffer
+		// upload - cleared the entire destination for nothing.
+		auto*    destination = static_cast<uint8_t*>(data);
+		uint64_t covered_end = vaddr;
 		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
 		     ++mapping) {
 			const auto& entry  = mapping->second;
 			const auto  start  = std::max(vaddr, entry.vaddr);
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
 			const auto  offset = entry.backing_offset + start - entry.vaddr;
-			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+			if (start > covered_end) {
+				std::memset(destination + (covered_end - vaddr), 0, start - covered_end);
+			}
+			std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
+			covered_end = start + bytes;
+		}
+		if (covered_end < end) {
+			std::memset(destination + (covered_end - vaddr), 0, end - covered_end);
 		}
 		return true;
 	}
@@ -443,54 +447,20 @@ private:
 class GuestAddressSpace {
 public:
 	explicit GuestAddressSpace(uint64_t backing_size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		SYSTEM_INFO info {};
-		GetSystemInfo(&info);
-		m_granularity = info.dwAllocationGranularity;
-#endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
-			     "this up front, so the paging file is usually what needs to be larger.\n",
-			     backing_size / (1024U * 1024U));
-#else
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",
 			     backing_size / (1024U * 1024U));
-#endif
 		}
 	}
 
 	~GuestAddressSpace() {
 		delete m_backing;
 		m_backing = nullptr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& [start, size]: m_owned) {
-			const auto end     = start + size;
-			auto       current = start;
-			while (current < end) {
-				MEMORY_BASIC_INFORMATION info {};
-				EXIT_IF(VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) ==
-				        0);
-				const auto region_start = reinterpret_cast<uint64_t>(info.BaseAddress);
-				const auto region_end   = region_start + static_cast<uint64_t>(info.RegionSize);
-				if (info.State == MEM_COMMIT) {
-					EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_start), info.RegionSize,
-					                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
-					continue;
-				}
-				if (info.State == MEM_RESERVE) {
-					EXIT_IF(VirtualFree(info.AllocationBase, 0, MEM_RELEASE) == 0);
-				}
-				current = region_end;
-			}
-		}
-#else
 		for (const auto& [start, size]: m_owned) {
 			munmap(reinterpret_cast<void*>(start), size);
 		}
-#endif
 	}
 
 	KYTY_CLASS_NO_COPY(GuestAddressSpace);
@@ -653,27 +623,12 @@ public:
 		                           ? VirtualMemory::Mode::ExecuteReadWrite
 		                           : VirtualMemory::Mode::ReadWrite;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-		                          GetProtect(host_mode), nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
-			if (ptr != nullptr) {
-				VirtualFree(ptr, 0, MEM_RELEASE);
-			}
-			AddFreeUnlocked(vaddr, size);
-			return false;
-		}
-		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
-		return true;
-#else
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
 			return true;
 		}
 		AddFreeUnlocked(vaddr, size);
 		return false;
-#endif
 	}
 
 	bool ReleaseCommitted(uint64_t vaddr, uint64_t size) {
@@ -693,18 +648,9 @@ public:
 			regions.emplace_back(current, part_end - current);
 			current = part_end;
 		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& [region_vaddr, region_size]: regions) {
-			EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_vaddr), region_size,
-			                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
-		}
-		// ReleaseCommitted also publishes the aggregate span as one logical free range.
-		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
-#else
 		for (const auto& [region_vaddr, region_size]: regions) {
 			RestorePlaceholder(region_vaddr, region_size);
 		}
-#endif
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
 		AddFreeUnlocked(vaddr, size);
 		return true;
@@ -865,62 +811,8 @@ private:
 		return true;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static DWORD GetProtect(VirtualMemory::Mode mode) {
-		switch (mode) {
-			case VirtualMemory::Mode::Read: return PAGE_READONLY;
-			case VirtualMemory::Mode::Write:
-			case VirtualMemory::Mode::ReadWrite: return PAGE_READWRITE;
-			case VirtualMemory::Mode::Execute: return PAGE_EXECUTE;
-			case VirtualMemory::Mode::ExecuteRead: return PAGE_EXECUTE_READ;
-			case VirtualMemory::Mode::ExecuteWrite:
-			case VirtualMemory::Mode::ExecuteReadWrite: return PAGE_EXECUTE_READWRITE;
-			case VirtualMemory::Mode::NoAccess:
-			default: return PAGE_NOACCESS;
-		}
-	}
-#endif
 
 	void ReserveGuestRegions() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		constexpr uint64_t MinimumRegionSize = 0x1000000;
-		const auto         process           = GetCurrentProcess();
-		const auto         guest_end         = HOST_USER_MAX + 1u;
-		auto               next_addr         = HOST_SYSTEM_MANAGED_MIN;
-
-		while (next_addr < guest_end) {
-			MEMORY_BASIC_INFORMATION info {};
-			if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) == 0) {
-				EXIT("failed to inspect guest address space at 0x%016" PRIx64 "\n", next_addr);
-			}
-
-			const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
-			const auto region_end =
-			    std::min<uint64_t>(guest_end, region_base + static_cast<uint64_t>(info.RegionSize));
-			const auto reserve_start =
-			    AlignUp(std::max<uint64_t>(region_base, HOST_SYSTEM_MANAGED_MIN), m_granularity);
-			const auto reserve_end = AlignDown(region_end, m_granularity);
-
-			if (info.State == MEM_FREE && reserve_end > reserve_start &&
-			    reserve_end - reserve_start > MinimumRegionSize) {
-				auto* ptr = VirtualAlloc2(
-				    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
-				    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
-				if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
-					EXIT("failed to reserve guest address space at 0x%016" PRIx64
-					     ", size 0x%016" PRIx64 "\n",
-					     reserve_start, reserve_end - reserve_start);
-				}
-				AddFreeUnlocked(reserve_start, reserve_end - reserve_start);
-				m_owned.emplace_back(reserve_start, reserve_end - reserve_start);
-			}
-
-			if (region_end <= next_addr) {
-				EXIT("guest address-space scan did not advance at 0x%016" PRIx64 "\n", next_addr);
-			}
-			next_addr = region_end;
-		}
-#else
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u},
 		    {HOST_SYSTEM_RESERVED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
@@ -994,7 +886,6 @@ private:
 				reserve_range(current, region_end);
 			}
 		}
-#endif
 	}
 
 	uint64_t FindFreeAlignedUnlocked(uint64_t search_start, uint64_t search_end, uint64_t size,
@@ -1031,34 +922,11 @@ private:
 
 		if (base != vaddr) {
 			const auto left_size = vaddr - base;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(base), left_size,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
-				LOGF_COLOR(Log::Color::Red,
-				           "\t guest placeholder split failed: base=0x%016" PRIx64
-				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
-				           " request_size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
-				           base, end - base, vaddr, size, static_cast<uint32_t>(GetLastError()));
-				return false;
-			}
-#endif
 			it->second = left_size;
 			it         = m_free.emplace(vaddr, end - vaddr).first;
 		}
 
 		if (it->second != size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(it->first), size,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
-				LOGF_COLOR(Log::Color::Red,
-				           "\t guest placeholder split failed: base=0x%016" PRIx64
-				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
-				           " request_size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
-				           it->first, it->second, vaddr, size,
-				           static_cast<uint32_t>(GetLastError()));
-				return false;
-			}
-#endif
 			const auto right_start = it->first + size;
 			const auto right_size  = it->second - size;
 			it->second             = size;
@@ -1097,29 +965,17 @@ private:
 		}
 
 		if (base != it->first || end != it->first + it->second) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (CoalescePlaceholders(base, end - base)) {
-				m_free.erase(first, last);
-				m_free.emplace(base, end - base);
-			}
-#else
 			m_free.erase(first, last);
 			m_free.emplace(base, end - base);
-#endif
 		}
 	}
 
 	void RestorePlaceholder(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 		// The address remains owned for the process lifetime; MAP_FIXED only replaces one of our
 		// mappings and never acquires a new guest address.
 		void* ptr = mmap(reinterpret_cast<void*>(vaddr), size, PROT_NONE,
 		                 MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
 		EXIT_IF(ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != vaddr);
-#else
-		(void)vaddr;
-		(void)size;
-#endif
 	}
 
 	std::mutex                                 m_mutex;

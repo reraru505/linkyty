@@ -7,36 +7,39 @@
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <utility>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#undef min
-#undef max
-#elif defined(__APPLE__)
-#include <pthread.h>
-#elif defined(__linux__)
+#include <x86intrin.h>
+
 #include <sys/syscall.h>
 #include <unistd.h>
-#endif
 
 namespace Libs::Graphics {
 
-class TrackingSpinLock final {
+// The lock guards the region's dirty/readable bitmaps, and those bitmaps are read by other
+// threads *without* taking the lock. At 8 bytes wide the lock therefore shares a cache line with
+// data those readers are using, so every acquire invalidates lines they hold: with 12 guest
+// threads touching adjacent regions this becomes pure coherence traffic. Give the lock its own
+// line and tell the SMT sibling to step aside while spinning instead of burning its issue slots.
+class alignas(64) TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		for (uint32_t spin = 0; m_lock.test_and_set(std::memory_order_acquire); spin++) {
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			// A short pause absorbs the usual handover; yielding periodically keeps a longer wait
+			// from stealing the issue slots of whichever thread is running on the SMT sibling.
+			if ((spin & 0x3fu) == 0x3fu) {
+				std::this_thread::yield();
+			} else {
+				_mm_pause();
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -50,17 +53,8 @@ public:
 
 private:
 	static uint32_t CurrentThread() noexcept {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
-#elif defined(__APPLE__)
-		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
-		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
-#elif defined(__linux__)
 		static thread_local const uint32_t tid = static_cast<uint32_t>(::syscall(SYS_gettid));
 		return tid;
-#else
-		EXIT("region tracking thread identity is unsupported on this platform\n");
-#endif
 	}
 
 	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;

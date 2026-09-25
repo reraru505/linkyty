@@ -23,30 +23,11 @@
 #include <mutex>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h> // IWYU pragma: keep
-#ifndef MEM_RESERVE_PLACEHOLDER
-#define MEM_RESERVE_PLACEHOLDER 0x00040000
-#endif
-#ifndef MEM_REPLACE_PLACEHOLDER
-#define MEM_REPLACE_PLACEHOLDER 0x00004000
-#endif
-#ifndef MEM_PRESERVE_PLACEHOLDER
-#define MEM_PRESERVE_PLACEHOLDER 0x00000002
-#endif
-#ifndef MEM_COALESCE_PLACEHOLDERS
-#define MEM_COALESCE_PLACEHOLDERS 0x00000001
-#endif
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#endif
 
 namespace Libs::LibKernel::Memory {
 
@@ -556,20 +537,30 @@ private:
 			return;
 		}
 
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
+		const auto edit_end = End(start, size);
+		// m_ranges is kept in ascending start order, so everything this edit can touch is one
+		// window: edit that in place instead of rebuilding (and reallocating) the whole list.
+		auto first = std::lower_bound(
+		    m_ranges.begin(), m_ranges.end(), start, [](const Range& range, uint64_t value) {
+			    return End(range.start, range.size) <= value;
+		    });
+		if (first == m_ranges.end() || first->start >= edit_end) {
+			return;
+		}
+		auto last = std::lower_bound(first, m_ranges.end(), edit_end,
+		                             [](const Range& range, uint64_t value) {
+			                             return range.start < value;
+		                             });
 
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
+		m_scratch.clear();
+		for (auto it = first; it != last; ++it) {
+			const auto& r     = *it;
+			const auto  r_end = End(r.start, r.size);
 
-			auto mid_start = std::max(start, r.start);
-			auto mid_end   = std::min(edit_end, r_end);
+			const auto mid_start = std::max(start, r.start);
+			const auto mid_end   = std::min(edit_end, r_end);
 
-			AddPiece(&out, r, r.start, mid_start);
+			AddPiece(&m_scratch, r, r.start, mid_start);
 
 			Range mid = r;
 			mid.start = mid_start;
@@ -578,12 +569,12 @@ private:
 				mid.offset += mid_start - r.start;
 			}
 			edit(&mid);
-			out.push_back(mid);
+			m_scratch.push_back(mid);
 
-			AddPiece(&out, r, mid_end, r_end);
+			AddPiece(&m_scratch, r, mid_end, r_end);
 		}
 
-		m_ranges = out;
+		ReplaceWindow(first - m_ranges.begin(), static_cast<size_t>(last - first));
 		MergeUnlocked();
 	}
 
@@ -592,24 +583,40 @@ private:
 			return false;
 		}
 
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
+		const auto rem_end = End(start, size);
+		auto       first   = std::lower_bound(
+		    m_ranges.begin(), m_ranges.end(), start, [](const Range& range, uint64_t value) {
+			    return End(range.start, range.size) <= value;
+		    });
+		if (first == m_ranges.end() || first->start >= rem_end) {
+			return false;
+		}
+		auto last = std::lower_bound(first, m_ranges.end(), rem_end,
+		                             [](const Range& range, uint64_t value) {
+			                             return range.start < value;
+		                             });
 
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		m_scratch.clear();
+		for (auto it = first; it != last; ++it) {
+			const auto& r     = *it;
+			const auto  r_end = End(r.start, r.size);
+			AddPiece(&m_scratch, r, r.start, std::max(start, r.start));
+			AddPiece(&m_scratch, r, std::min(rem_end, r_end), r_end);
 		}
 
-		m_ranges = out;
-		return removed;
+		ReplaceWindow(first - m_ranges.begin(), static_cast<size_t>(last - first));
+		return true;
+	}
+
+	// Puts m_scratch in place of m_ranges[first, first + count).
+	void ReplaceWindow(std::ptrdiff_t first, size_t count) {
+		const auto begin = m_ranges.begin() + first;
+		if (m_scratch.size() == count) {
+			std::copy(m_scratch.begin(), m_scratch.end(), begin);
+			return;
+		}
+		m_ranges.erase(begin, begin + static_cast<std::ptrdiff_t>(count));
+		m_ranges.insert(m_ranges.begin() + first, m_scratch.begin(), m_scratch.end());
 	}
 
 	void MergeUnlocked() {
@@ -617,21 +624,24 @@ private:
 			return;
 		}
 
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
+		// The list is already in ascending start order, so merging is one in-place pass: this used
+		// to sort and build a second vector on every protection change.
+		size_t write = 0;
+		for (size_t read = 0; read < m_ranges.size(); read++) {
+			if (write != 0) {
+				auto& previous = m_ranges[write - 1];
+				if (End(previous.start, previous.size) == m_ranges[read].start &&
+				    SameMergeKey(previous, m_ranges[read])) {
+					previous.size += m_ranges[read].size;
 					continue;
 				}
 			}
-			merged.push_back(r);
+			if (write != read) {
+				m_ranges[write] = m_ranges[read];
+			}
+			write++;
 		}
-		m_ranges = merged;
+		m_ranges.resize(write);
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {
@@ -650,6 +660,7 @@ private:
 	}
 
 	std::vector<Range> m_ranges;
+	std::vector<Range> m_scratch;
 	Common::Mutex      m_mutex;
 };
 
@@ -657,6 +668,45 @@ private:
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
 static bool     g_test_fail_next_fixed_reserve_range_add     = false;
 #endif
+
+// Both mapping lists are ordered by map_vaddr and are rewritten on every guest protection change.
+// Rebuilding the whole vector per call (allocate, copy every block, free) made each mprotect O(n):
+// measured ~20 us with 1024 live mappings. Find the affected window and edit it in place instead,
+// reusing one scratch vector so a protection change never allocates.
+template <typename Block>
+struct MappingWindow {
+	size_t first = 0;
+	size_t last  = 0;
+};
+
+template <typename Block>
+MappingWindow<Block> FindMappingWindow(const std::vector<Block>& mappings, uint64_t vaddr,
+                                       uint64_t size) {
+	const auto end   = vaddr + size;
+	auto       first = std::lower_bound(
+	    mappings.begin(), mappings.end(), vaddr, [](const Block& block, uint64_t value) {
+		    return block.map_vaddr + block.map_size <= value;
+	    });
+	if (first == mappings.end() || first->map_vaddr >= end) {
+		return {mappings.size(), mappings.size()};
+	}
+	auto last = std::lower_bound(first, mappings.end(), end,
+	                             [](const Block& block, uint64_t value) {
+		                             return block.map_vaddr < value;
+	                             });
+	return {static_cast<size_t>(first - mappings.begin()),
+	        static_cast<size_t>(last - mappings.begin())};
+}
+
+template <typename Block>
+void InsertMappingSorted(std::vector<Block>& mappings, const Block& block) {
+	const auto position =
+	    std::lower_bound(mappings.begin(), mappings.end(), block.map_vaddr,
+	                     [](const Block& existing, uint64_t value) {
+		                     return existing.map_vaddr < value;
+	                     });
+	mappings.insert(position, block);
+}
 
 class PhysicalMemory {
 public:
@@ -725,6 +775,7 @@ private:
 	std::map<uint64_t, AllocatedBlock> m_physical;
 	std::map<uint64_t, uint64_t>       m_free;
 	std::vector<AllocatedBlock>        m_mappings;
+	std::vector<AllocatedBlock>        m_update_scratch;
 	Common::Mutex                      m_mutex;
 };
 
@@ -775,6 +826,7 @@ private:
 
 	std::vector<AllocatedBlock>  m_allocated;
 	std::map<uint64_t, uint64_t> m_free;
+	std::vector<AllocatedBlock>  m_update_scratch;
 	uint64_t                     m_allocated_total = 0;
 	Common::Mutex                m_mutex;
 };
@@ -823,6 +875,24 @@ static std::atomic<uint64_t>              g_memory_pool_committed = 0;
 static void                               MemoryPoolSubtractCommitted(uint64_t len);
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
+static std::atomic<uint64_t>  g_memory_operation_locks {0};
+
+namespace {
+// Scoped acquisition of the guest memory-operation lock. Counts acquisitions so the lock can be
+// shown to be cold (or not) via LINKYTY_TRACE_LOCKS instead of being argued about.
+struct MemoryOperationLock {
+	MemoryOperationLock() {
+		g_memory_operation_mutex.lock();
+		const auto count = g_memory_operation_locks.fetch_add(1) + 1;
+		if (std::getenv("LINKYTY_TRACE_LOCKS") != nullptr && count % 4096u == 0u) {
+			LOGF("DBGLOCK: memory_operations=%llu\n",
+			     static_cast<unsigned long long>(count));
+		}
+	}
+	~MemoryOperationLock() { g_memory_operation_mutex.unlock(); }
+	KYTY_CLASS_NO_COPY(MemoryOperationLock);
+};
+} // namespace
 
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
@@ -986,44 +1056,7 @@ bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	constexpr uint64_t PageSize    = 0x4000;
-	const auto         granularity = g_guest_address_space->GetGranularity();
-	if (granularity < PageSize * 2u) {
-		LOGF_COLOR(
-		    Log::Color::Yellow,
-		    "\t direct-memory sub-64K placeholder self-test skipped: granularity too small\n");
-		return true;
-	}
-
-	const auto base = FindGuestFreeRange(0, granularity, granularity);
-	if (base == 0) {
-		LOGF_COLOR(Log::Color::Red,
-		           "\t direct-memory sub-64K placeholder self-test: reserve unavailable\n");
-		return false;
-	}
-
-	const auto alias          = base + PageSize;
-	bool       ok             = false;
-	auto       failure_reason = GuestBackingStore::FailureReason::None;
-	if (g_guest_address_space->MapBacking(alias, PageSize, PageSize, VirtualMemory::Mode::ReadWrite,
-	                                      &failure_reason)) {
-		auto* ptr = reinterpret_cast<uint64_t*>(alias);
-		*ptr      = 0x4b59545953553634ull; // "KYTYSU64"
-		ok        = (*ptr == 0x4b59545953553634ull);
-		std::memset(ptr, 0, PageSize);
-
-		ok = g_guest_address_space->UnmapBacking(alias, PageSize) && ok;
-	}
-
-	LOGF_COLOR(
-	    ok ? Log::Color::Green : Log::Color::Red,
-	    "\t direct-memory sub-64K placeholder self-test: %s%s%s\n", ok ? "ok" : "failed",
-	    ok ? "" : ", reason = ", ok ? "" : GuestBackingStore::GetFailureReasonName(failure_reason));
-	return ok;
-#else
 	return true;
-#endif
 }
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
@@ -1073,7 +1106,7 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	EXIT_IF(g_alloc_callback != nullptr || g_free_callback != nullptr);
 	EXIT_IF(alloc_func == nullptr || free_func == nullptr);
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	g_alloc_callback = alloc_func;
 	g_free_callback  = free_func;
@@ -1355,7 +1388,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	mapping.prot           = prot;
 	mapping.mode           = mode;
 	mapping.gpu_mode       = gpu_mode;
-	m_mappings.push_back(mapping);
+	InsertMappingSorted(m_mappings, mapping);
 
 	return true;
 }
@@ -1500,7 +1533,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 
 			b.size     = vaddr - b.map_vaddr;
 			b.map_size = b.size;
-			m_mappings.push_back(right);
+			InsertMappingSorted(m_mappings, right);
 			return true;
 		}
 		if (vaddr == b.map_vaddr && size < b.map_size) {
@@ -1532,22 +1565,23 @@ void PhysicalMemory::ProtectMapping(uint64_t vaddr, uint64_t size, int prot,
 		return;
 	}
 
-	const auto                  end = vaddr + size;
-	std::vector<AllocatedBlock> updated;
-	updated.reserve(m_mappings.size() + 2);
-	for (const auto& block: m_mappings) {
-		const auto block_end = block.map_vaddr + block.map_size;
-		if (!VirtualRangesOverlap(vaddr, size, block.map_vaddr, block.map_size)) {
-			updated.push_back(block);
-			continue;
-		}
-		const auto overlap_start = std::max(vaddr, block.map_vaddr);
-		const auto overlap_end   = std::min(end, block_end);
+	const auto end    = vaddr + size;
+	const auto window = FindMappingWindow(m_mappings, vaddr, size);
+	if (window.first == window.last) {
+		return;
+	}
+
+	m_update_scratch.clear();
+	for (size_t index = window.first; index < window.last; index++) {
+		const auto& block      = m_mappings[index];
+		const auto  block_end  = block.map_vaddr + block.map_size;
+		const auto  overlap_start = std::max(vaddr, block.map_vaddr);
+		const auto  overlap_end   = std::min(end, block_end);
 		if (block.map_vaddr < overlap_start) {
 			auto left     = block;
 			left.size     = overlap_start - block.map_vaddr;
 			left.map_size = left.size;
-			updated.push_back(left);
+			m_update_scratch.push_back(left);
 		}
 		auto middle       = block;
 		middle.start_addr = block.start_addr + overlap_start - block.map_vaddr;
@@ -1557,17 +1591,26 @@ void PhysicalMemory::ProtectMapping(uint64_t vaddr, uint64_t size, int prot,
 		middle.prot       = prot;
 		middle.mode       = mode;
 		middle.gpu_mode   = gpu_mode;
-		updated.push_back(middle);
+		m_update_scratch.push_back(middle);
 		if (overlap_end < block_end) {
 			auto right       = block;
 			right.start_addr = block.start_addr + overlap_end - block.map_vaddr;
 			right.size       = block_end - overlap_end;
 			right.map_vaddr  = overlap_end;
 			right.map_size   = right.size;
-			updated.push_back(right);
+			m_update_scratch.push_back(right);
 		}
 	}
-	m_mappings = std::move(updated);
+
+	if (m_update_scratch.size() == window.last - window.first) {
+		std::copy(m_update_scratch.begin(), m_update_scratch.end(),
+		          m_mappings.begin() + static_cast<std::ptrdiff_t>(window.first));
+		return;
+	}
+	m_mappings.erase(m_mappings.begin() + static_cast<std::ptrdiff_t>(window.first),
+	                 m_mappings.begin() + static_cast<std::ptrdiff_t>(window.last));
+	m_mappings.insert(m_mappings.begin() + static_cast<std::ptrdiff_t>(window.first),
+	                  m_update_scratch.begin(), m_update_scratch.end());
 }
 
 bool PhysicalMemory::Find(uint64_t phys_addr, bool next, AllocatedBlock* out) {
@@ -1914,39 +1957,51 @@ void FlexibleMemory::Protect(uint64_t vaddr, uint64_t size, int prot, VirtualMem
 		return;
 	}
 
-	const auto                  end = vaddr + size;
-	std::vector<AllocatedBlock> updated;
-	updated.reserve(m_allocated.size() + 2);
-	for (const auto& block: m_allocated) {
-		const auto block_end = block.map_vaddr + block.map_size;
-		if (!VirtualRangesOverlap(vaddr, size, block.map_vaddr, block.map_size)) {
-			updated.push_back(block);
-			continue;
-		}
-		const auto overlap_start = std::max(vaddr, block.map_vaddr);
-		const auto overlap_end   = std::min(end, block_end);
+	const auto end    = vaddr + size;
+	const auto window = FindMappingWindow(m_allocated, vaddr, size);
+	if (window.first == window.last) {
+		return;
+	}
+
+	m_update_scratch.clear();
+	for (size_t index = window.first; index < window.last; index++) {
+		const auto& block         = m_allocated[index];
+		const auto  block_end     = block.map_vaddr + block.map_size;
+		const auto  overlap_start = std::max(vaddr, block.map_vaddr);
+		const auto  overlap_end   = std::min(end, block_end);
 		if (block.map_vaddr < overlap_start) {
 			auto left     = block;
 			left.map_size = overlap_start - block.map_vaddr;
-			updated.push_back(left);
+			m_update_scratch.push_back(left);
 		}
-		auto middle           = block;
-		middle.map_vaddr      = overlap_start;
-		middle.map_size       = overlap_end - overlap_start;
-		middle.backing_offset = block.backing_offset + overlap_start - block.map_vaddr;
-		middle.prot           = prot;
-		middle.mode           = mode;
-		middle.gpu_mode       = gpu_mode;
-		updated.push_back(middle);
+		auto middle       = block;
+		middle.map_vaddr  = overlap_start;
+		middle.map_size   = overlap_end - overlap_start;
+		middle.host_vaddr = block.host_vaddr + (overlap_start - block.map_vaddr);
+		middle.host_size  = middle.map_size;
+		middle.prot       = prot;
+		middle.mode       = mode;
+		middle.gpu_mode   = gpu_mode;
+		m_update_scratch.push_back(middle);
 		if (overlap_end < block_end) {
-			auto right           = block;
-			right.map_vaddr      = overlap_end;
-			right.map_size       = block_end - overlap_end;
-			right.backing_offset = block.backing_offset + overlap_end - block.map_vaddr;
-			updated.push_back(right);
+			auto right       = block;
+			right.map_vaddr  = overlap_end;
+			right.map_size   = block_end - overlap_end;
+			right.host_vaddr = block.host_vaddr + (overlap_end - block.map_vaddr);
+			right.host_size  = right.map_size;
+			m_update_scratch.push_back(right);
 		}
 	}
-	m_allocated = std::move(updated);
+
+	if (m_update_scratch.size() == window.last - window.first) {
+		std::copy(m_update_scratch.begin(), m_update_scratch.end(),
+		          m_allocated.begin() + static_cast<std::ptrdiff_t>(window.first));
+		return;
+	}
+	m_allocated.erase(m_allocated.begin() + static_cast<std::ptrdiff_t>(window.first),
+	                  m_allocated.begin() + static_cast<std::ptrdiff_t>(window.last));
+	m_allocated.insert(m_allocated.begin() + static_cast<std::ptrdiff_t>(window.first),
+	                   m_update_scratch.begin(), m_update_scratch.end());
 }
 
 bool FlexibleMemory::Find(uint64_t vaddr, uint64_t* base_addr, size_t* len, int* prot,
@@ -2220,7 +2275,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
                                                    int flags, const char* name) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
 
@@ -2353,7 +2408,7 @@ int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int pr
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	const auto address = reinterpret_cast<uint64_t>(addr);
 
@@ -2431,7 +2486,7 @@ int KYTY_SYSV_ABI KernelGetPrtAperture(int index, void** addr, size_t* len) {
 int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -2458,7 +2513,7 @@ int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, cons
 int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -2558,7 +2613,7 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t start = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n",
@@ -2584,7 +2639,7 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
                                                   size_t* size_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t search_start = 0x%016" PRIx64 "\n"
 	     "\t search_end   = 0x%016" PRIx64 "\n"
@@ -2632,7 +2687,7 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
                                           int* gpu_available) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	if (cpu_total == nullptr || cpu_available == nullptr || gpu_total == nullptr ||
 	    gpu_available == nullptr) {
@@ -2665,7 +2720,7 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t offset    = 0x%016" PRIx64 "\n"
 	     "\t flags     = 0x%08" PRIx32 "\n"
@@ -2741,7 +2796,7 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len,
                                              size_t alignment, int memory_type,
                                              int64_t* phys_addr_out) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t search_start = 0x%016" PRIx64 "\n"
 	     "\t search_end   = 0x%016" PRIx64 "\n"
@@ -2774,7 +2829,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
                                                  int64_t* phys_addr_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t len          = 0x%016" PRIx64 "\n"
 	     "\t alignment    = 0x%016" PRIx64 "\n"
@@ -2786,7 +2841,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 }
 
 static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	if (g_pooled_memory->ReleaseExpansion(static_cast<uint64_t>(start), len)) {
 		if (!g_physical_memory->ReleasePoolExpansion(static_cast<uint64_t>(start), len)) {
@@ -2917,7 +2972,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	if (addr == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3074,7 +3129,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t type = %d\n", type);
 
@@ -3091,7 +3146,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
                                              int64_t direct_memory_start, size_t alignment,
                                              const char* name) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t name = %s\n", name != nullptr ? name : "(null)");
 
@@ -3121,7 +3176,7 @@ int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled() {
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	EXIT_NOT_IMPLEMENTED(addr == nullptr);
 
@@ -3346,7 +3401,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	const auto in_addr = (addr != nullptr ? reinterpret_cast<uint64_t>(*addr) : 0);
 
@@ -3454,7 +3509,7 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
                                      uint64_t info_size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -3507,7 +3562,7 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -3543,7 +3598,7 @@ int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
 int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	if (size == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -3594,7 +3649,7 @@ static std::vector<VirtualRanges::Range> RequireGuestRuntimeMemory(uint64_t vadd
 static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
                                            VirtualMemory::Mode mode, const char* name,
                                            VirtualRangeType type, bool fixed) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	constexpr uint64_t GuestPageSize = 0x4000;
 	if (size == 0 || size > UINT64_MAX - (GuestPageSize - 1u) || name == nullptr ||
@@ -3625,7 +3680,7 @@ uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemor
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	const auto ranges = RequireGuestRuntimeMemory(vaddr, size);
 	if (std::any_of(ranges.begin(), ranges.end(),
@@ -3659,7 +3714,7 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size, VirtualMe
 
 bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
                         VirtualMemory::Mode* old_mode) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 	constexpr uint64_t                    GuestPageSize = 0x4000;
 	if (vaddr == 0 || size == 0 || size > UINT64_MAX - (vaddr & (GuestPageSize - 1u))) {
 		return false;
@@ -3685,7 +3740,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	constexpr uint64_t GuestPageSize = 0x4000;
 	if (vaddr == 0 || size == 0 || size > UINT64_MAX - (GuestPageSize - 1u)) {
@@ -3700,7 +3755,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -3727,7 +3782,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	if (!DecodeMemoryProtection(prot, &mode, &gpu_mode)) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	std::vector<VirtualRanges::Range> old_ranges;
+	static thread_local std::vector<VirtualRanges::Range> old_ranges;
 	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
 	    std::any_of(old_ranges.begin(), old_ranges.end(),
 	                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
@@ -3762,7 +3817,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t addr = 0x%016" PRIx64 "\n"
 	     "\t len  = 0x%016" PRIx64 "\n"
@@ -3778,7 +3833,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
                                   int* num_entries_out, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t entries         = %p\n"
 	     "\t num_entries     = %d\n"
@@ -3879,7 +3934,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
                                          size_t alignment, int64_t* phys_addr_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	constexpr uint64_t POOL_PAGE_SIZE = 0x10000;
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
@@ -3917,7 +3972,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
                                           void** addr_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t addr_in   = 0x%016" PRIx64 "\n"
 	     "\t len       = 0x%016" PRIx64 "\n"
@@ -3963,7 +4018,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t addr  = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n"
@@ -4094,7 +4149,7 @@ static int DecommitMemoryPoolRange(uint64_t vaddr, size_t len) {
 int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	LOGF("\t addr  = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n"
@@ -4136,7 +4191,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entrie
                                         int* num_entries_out, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	if (entries == nullptr || num_entries < 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -4192,7 +4247,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
                                                 size_t                      output_size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock                     memory_operation_lock;
 
 	if (output == nullptr && output_size != 0) {
 		return KERNEL_ERROR_EFAULT;

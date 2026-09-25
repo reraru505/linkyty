@@ -13,6 +13,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -213,15 +214,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
-	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
-	constexpr int64_t target_threshold = 8 * GiB;
+	constexpr int64_t GiB = 1024ll * 1024 * 1024;
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	// Mirror the texture cache policy: hold a reserve rather than filling the heap, because a
+	// buffer is a re-creatable mirror of guest memory but an allocation that does not fit is fatal.
+	const auto reserve   = std::clamp<int64_t>(budget / 3, 5 * GiB / 4, 2 * GiB);
+	const auto critical  = std::max<int64_t>(budget - reserve, 0);
+	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 2 * reserve, critical / 2), GiB / 2));
+	m_critical_gc_memory = static_cast<uint64_t>(critical);
 }
 
 BufferCache::~BufferCache() {
@@ -619,13 +620,30 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	if (std::getenv("LINKYTY_TRACE_MEMORY") != nullptr && tick % 30u == 0u) {
+		uint64_t buffers = 0;
+		uint64_t bytes   = 0;
+		m_slot_buffers.ForEach([&](BufferId, const Buffer& buffer) {
+			buffers++;
+			bytes += buffer.Size();
+		});
+		LOGF("DBGBUF: tick=%llu device=%llu buffers=%llu buffer_bytes=%llu\n",
+		     static_cast<unsigned long long>(tick),
+		     static_cast<unsigned long long>(m_total_used_memory),
+		     static_cast<unsigned long long>(buffers),
+		     static_cast<unsigned long long>(bytes));
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
-	const size_t   limit      = aggressive ? 64 : 32;
+	// Buffers are mirrors of guest memory, so reclaiming them under critical pressure only costs a
+	// re-upload. Destruction is deferred to the collecting tick's completion, which keeps a buffer
+	// the GPU is still reading from an older tick alive.
+	// Same A/B as the texture cache: later, smaller collections performed better under pressure.
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 320, tick);
+	const size_t   limit      = aggressive ? 128 : 16;
 
 	std::vector<BufferId> dirty_buffers;
 	std::vector<DownloadCopy> copies;

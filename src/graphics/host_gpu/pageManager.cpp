@@ -12,21 +12,11 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#undef min
-#undef max
-#elif defined(__APPLE__)
-#include <unistd.h>
-#else
 #include <execinfo.h>
 #include <unistd.h>
-#endif
 
 namespace Libs::Graphics {
 namespace {
@@ -36,13 +26,11 @@ constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
 constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // The tracker reuses Win32 memory-protection tags as internal page-state values.
 // Mirror their canonical numeric values so the shared state-machine logic is identical.
 constexpr uint32_t PAGE_NOACCESS  = 0x01;
 constexpr uint32_t PAGE_READONLY  = 0x02;
 constexpr uint32_t PAGE_READWRITE = 0x04;
-#endif
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
 constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
@@ -53,25 +41,11 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
 	std::fputc('\n', stderr);
-#if !defined(__APPLE__)
 	void* frames[16] {};
 	int   frame_count = static_cast<int>(std::size(frames));
 	SysStackWalk(frames, &frame_count);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const auto image_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-	for (int i = 0; i < frame_count; i++) {
-		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
-		std::fprintf(stderr, "  frame[%d]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR "\n", i,
-		             address, address >= image_base ? address - image_base : 0);
-	}
-#else
 	::backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
-#endif
-#endif
 	std::fflush(stderr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
-#endif
 	std::_Exit(322);
 }
 
@@ -98,8 +72,12 @@ Common::VirtualMemory::Mode ToMemoryMode(uint32_t protection) {
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+		for (uint32_t spin = 0; m_lock.test_and_set(std::memory_order_acquire); spin++) {
+			if ((spin & 0x3fu) == 0x3fu) {
+				std::this_thread::yield();
+			} else {
+				_mm_pause();
+			}
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
@@ -177,30 +155,18 @@ struct PageManager::Impl {
 	};
 	static_assert(sizeof(PageState) == 1);
 
-	struct Region {
-		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
+	// The lock is taken while the page states next to it are being rewritten, so keep it on a
+	// line of its own and keep each region itself cache-line aligned.
+	struct alignas(64) Region {
+		alignas(64) std::atomic_flag        lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
 	};
 
 	Impl() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		SYSTEM_INFO info {};
-		GetSystemInfo(&info);
-		if (info.dwPageSize != PAGE_SIZE) {
-			Fatal("unsupported host page size 0x%08" PRIx32,
-			      static_cast<uint32_t>(info.dwPageSize));
-		}
-#elif defined(__APPLE__)
-		// Under Rosetta the host page size is 4 KB, matching TRACKER_PAGE_SIZE.
-		if (static_cast<uint64_t>(getpagesize()) != PAGE_SIZE) {
-			Fatal("unsupported host page size 0x%08" PRIx32, static_cast<uint32_t>(getpagesize()));
-		}
-#else
 		const auto host_page_size = ::sysconf(_SC_PAGESIZE);
 		if (host_page_size < 0 || static_cast<uint64_t>(host_page_size) != PAGE_SIZE) {
 			Fatal("unsupported host page size %ld", static_cast<long>(host_page_size));
 		}
-#endif
 		regions = std::make_unique<std::atomic<Region*>[]>(REGION_COUNT);
 		for (uint64_t i = 0; i < REGION_COUNT; i++) {
 			regions[i].store(nullptr, std::memory_order_relaxed);

@@ -45,8 +45,27 @@ static void SleepHighResolutionNanos(uint64_t nanos) {
 		return;
 	}
 
-	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
+	// The kernel rounds sleeps up by its timer slack (tens of microseconds), which is visible as
+	// frame-pacing jitter in the present thread. Sleep to just before the deadline and spin the
+	// remainder: the same trade the short-wait path above already makes.
+	timespec sleep_until = deadline;
+	if (static_cast<uint64_t>(sleep_until.tv_nsec) >= SPIN_LIMIT_NS) {
+		sleep_until.tv_nsec -= static_cast<long>(SPIN_LIMIT_NS);
+	} else {
+		sleep_until.tv_sec -= 1;
+		sleep_until.tv_nsec += static_cast<long>(NANOS_PER_SEC) - static_cast<long>(SPIN_LIMIT_NS);
 	}
+
+	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &sleep_until, nullptr) == EINTR) {
+	}
+
+	timespec now {};
+	do {
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+			return;
+		}
+	} while (now.tv_sec < deadline.tv_sec ||
+	         (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
 }
 #endif
 
