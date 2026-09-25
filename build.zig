@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const cpp_flags = [_][]const u8{
         "-std=c++20",
         "-D_GNU_SOURCE",
-        "-DKYTY_PLATFORM=5", // KYTY_PLATFORM_LINUX
+
         "-DKYTY_ENDIAN=2",   // KYTY_ENDIAN_LITTLE
         "-D_TIMESPEC_DEFINED",
         "-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES",
@@ -275,4 +275,176 @@ pub fn build(b: *std.Build) void {
     // Deliberately a separate step rather than folded into `test`: this suite needs the full
     // emulator source closure (kernel/memory.cpp references Libs::Graphics), so it is an
     // order of magnitude more expensive to build than the synchronization tests.
+
+    // -------------------------------------------------------------------------
+    // Target 5: waterfall descriptor tests (shader recompiler regression suite)
+    // -------------------------------------------------------------------------
+    // Focused harness that links only the typed IR passes, so it stays free of the Vulkan/SDL
+    // toolchain and runs in well under a second.
+    const shader_test_flags = [_][]const u8{
+        "-std=c++20",
+        "-D_GNU_SOURCE",
+
+        "-DKYTY_ENDIAN=2",
+        "-D_TIMESPEC_DEFINED",
+        "-Wno-pragma-pack",
+        "-Wno-deprecated-declarations",
+        "-Wno-unused-function",
+        "-Wno-unused-variable",
+    };
+    const shader_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    shader_test_mod.link_libc = true;
+    shader_test_mod.linkSystemLibrary("stdc++", .{});
+    for (include_paths) |inc| {
+        if (std.mem.startsWith(u8, inc, "/")) {
+            shader_test_mod.addIncludePath(.{ .cwd_relative = inc });
+        } else {
+            shader_test_mod.addIncludePath(b.path(inc));
+        }
+    }
+    shader_test_mod.linkSystemLibrary("pthread", .{});
+    shader_test_mod.linkSystemLibrary("dl", .{});
+    shader_test_mod.linkSystemLibrary("m", .{});
+    shader_test_mod.addCSourceFiles(.{ .files = &sources.fmt, .flags = &shader_test_flags });
+    shader_test_mod.addCSourceFiles(.{
+        .files = &.{
+            // The typed-IR implementation set is amalgamated into the harness itself.
+            "tests/WaterfallDescriptorTests.cpp",
+            "src/common/dateTime.cpp",
+            "src/common/emulatorConfig.cpp",
+            "src/common/file.cpp",
+            "src/common/logging/log.cpp",
+            "src/common/platform/sysLinuxFileIO.cpp",
+            "src/graphics/guest_gpu/gpu_format.cpp",
+            "src/graphics/shader/shaderPixelParameter.cpp",
+            "src/graphics/shader/recompiler/ir/passes/BindingLayout.cpp",
+            "src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp",
+            "src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp",
+            "src/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp",
+            "src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp",
+            "src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp",
+            "src/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp",
+            "src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp",
+            "src/graphics/shader/recompiler/ir/passes/SsaRewrite.cpp",
+            "src/graphics/shader/recompiler/ir/passes/WaterfallDescriptor.cpp",
+        },
+        .flags = &shader_test_flags,
+    });
+
+    // Not installed: `zig build` stays lean, the suite is built on demand by `test-shader`.
+    const shader_test_exe = b.addExecutable(.{
+        .name = "waterfall_descriptor_tests",
+        .root_module = shader_test_mod,
+    });
+
+    const run_shader_test_cmd = b.addRunArtifact(shader_test_exe);
+    const shader_test_step = b.step("test-shader", "Run shader recompiler regression tests");
+    shader_test_step.dependOn(&run_shader_test_cmd.step);
+
+    // -------------------------------------------------------------------------
+    // Target 6: spin-lock contention suite
+    // -------------------------------------------------------------------------
+    // Measures the emulator's own synchronization primitives under the access pattern the guest's
+    // job system produces, so lock layout changes can be evaluated in a second instead of by
+    // booting the game. Links only the common logging/assert closure plus the lock header.
+    const lock_test_flags = [_][]const u8{
+        "-std=c++20",
+        "-D_GNU_SOURCE",
+
+        "-DKYTY_ENDIAN=2",
+        "-D_TIMESPEC_DEFINED",
+        "-Wno-pragma-pack",
+        "-Wno-deprecated-declarations",
+        "-Wno-unused-function",
+        "-Wno-unused-variable",
+    };
+    const lock_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    lock_test_mod.link_libc = true;
+    lock_test_mod.linkSystemLibrary("stdc++", .{});
+    for (include_paths) |inc| {
+        if (std.mem.startsWith(u8, inc, "/")) {
+            lock_test_mod.addIncludePath(.{ .cwd_relative = inc });
+        } else {
+            lock_test_mod.addIncludePath(b.path(inc));
+        }
+    }
+    lock_test_mod.linkSystemLibrary("pthread", .{});
+    lock_test_mod.linkSystemLibrary("dl", .{});
+    lock_test_mod.linkSystemLibrary("m", .{});
+    lock_test_mod.addCSourceFiles(.{ .files = &sources.fmt, .flags = &lock_test_flags });
+    lock_test_mod.addCSourceFiles(.{
+        .files = &.{
+            "tests/LockContentionTests.cpp",
+            "src/common/assert.cpp",
+            "src/common/dateTime.cpp",
+            "src/common/emulatorConfig.cpp",
+            "src/common/file.cpp",
+            "src/common/logging/log.cpp",
+            "src/common/platform/sysLinuxDbg.cpp",
+            "src/common/platform/sysLinuxFileIO.cpp",
+            "src/common/subsystems.cpp",
+        },
+        .flags = &lock_test_flags,
+    });
+
+    const lock_test_exe = b.addExecutable(.{
+        .name = "lock_contention_tests",
+        .root_module = lock_test_mod,
+    });
+
+    const run_lock_test_cmd = b.addRunArtifact(lock_test_exe);
+    const lock_test_step = b.step("test-locks", "Run spin-lock contention benchmarks");
+    lock_test_step.dependOn(&run_lock_test_cmd.step);
+
+    // -------------------------------------------------------------------------
+    // Target 7: synchronization primitive benchmarks
+    // -------------------------------------------------------------------------
+    const sync_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    sync_test_mod.link_libc = true;
+    sync_test_mod.linkSystemLibrary("stdc++", .{});
+    for (include_paths) |inc| {
+        if (std.mem.startsWith(u8, inc, "/")) {
+            sync_test_mod.addIncludePath(.{ .cwd_relative = inc });
+        } else {
+            sync_test_mod.addIncludePath(b.path(inc));
+        }
+    }
+    sync_test_mod.linkSystemLibrary("pthread", .{});
+    sync_test_mod.linkSystemLibrary("dl", .{});
+    sync_test_mod.linkSystemLibrary("m", .{});
+    sync_test_mod.addCSourceFiles(.{ .files = &sources.fmt, .flags = &lock_test_flags });
+    sync_test_mod.addCSourceFiles(.{
+        .files = &.{
+            "tests/SyncPrimitiveTests.cpp",
+            "src/common/assert.cpp",
+            "src/common/dateTime.cpp",
+            "src/common/emulatorConfig.cpp",
+            "src/common/file.cpp",
+            "src/common/logging/log.cpp",
+            "src/common/platform/sysLinuxDbg.cpp",
+            "src/common/platform/sysLinuxFileIO.cpp",
+            "src/common/subsystems.cpp",
+            "src/common/threads.cpp",
+            "src/common/timer.cpp",
+        },
+        .flags = &lock_test_flags,
+    });
+
+    const sync_test_exe = b.addExecutable(.{
+        .name = "sync_primitive_tests",
+        .root_module = sync_test_mod,
+    });
+
+    const run_sync_test_cmd = b.addRunArtifact(sync_test_exe);
+    const sync_test_step = b.step("bench-sync", "Run synchronization primitive benchmarks");
+    sync_test_step.dependOn(&run_sync_test_cmd.step);
 }

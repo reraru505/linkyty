@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include <unordered_map>
+#include <mutex>
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -215,6 +217,52 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+// Counts program-cache lookups so a session can answer "is this shader being recompiled?" without
+// guessing from log lines. Reported every 4096 lookups when LINKYTY_TRACE_SHADER_CACHE is set.
+struct ShaderCacheCounters {
+	std::atomic<uint64_t>                       lookups {0};
+	std::atomic<uint64_t>                       hits {0};
+	std::atomic<uint64_t>                       misses {0};
+	std::atomic<uint64_t>                       permutations {0};
+	std::mutex                                  mutex;
+	std::unordered_map<uint64_t, uint32_t>      compiles_by_hash;
+
+	void ReportLookup(ShaderType stage, uint64_t hash, bool hit) {
+		const auto lookups_now = lookups.fetch_add(1) + 1;
+		(hit ? hits : misses).fetch_add(1);
+		if (!hit) {
+			std::lock_guard lock(mutex);
+			compiles_by_hash[hash]++;
+		}
+		if (std::getenv("LINKYTY_TRACE_SHADER_CACHE") == nullptr || lookups_now % 4096u != 0u) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, uint32_t>> top;
+		{
+			std::lock_guard lock(mutex);
+			top.assign(compiles_by_hash.begin(), compiles_by_hash.end());
+		}
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		LOGF("SHADERCACHE: lookups=%llu hits=%llu misses=%llu permutations=%llu distinct_misses=%llu "
+		     "stage=%d hash=0x%016" PRIx64 "\n",
+		     static_cast<unsigned long long>(lookups_now),
+		     static_cast<unsigned long long>(hits.load()),
+		     static_cast<unsigned long long>(misses.load()),
+		     static_cast<unsigned long long>(permutations.load()), static_cast<unsigned long long>(top.size()),
+		     static_cast<int>(stage), hash);
+		for (size_t i = 0; i < top.size() && i < 5; i++) {
+			LOGF("SHADERCACHE: top hash=0x%016" PRIx64 " misses=%u\n", top[i].first, top[i].second);
+		}
+	}
+};
+
+static ShaderCacheCounters g_shader_cache_counters;
+
+void ShaderCacheStats(ShaderType stage, uint64_t hash, bool hit) {
+	g_shader_cache_counters.ReportLookup(stage, hash, hit);
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -334,6 +382,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		ShaderCacheStats(stage, params.hash, entry != programs.end());
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -364,6 +413,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		g_shader_cache_counters.permutations.fetch_add(1);
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;

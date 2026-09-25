@@ -44,6 +44,11 @@ void SetThreadName(const char* name);
 void Initialize();
 void Shutdown();
 
+// Opt-in PC sampler for hosts where ptrace is unavailable: a helper thread wakes the threads that
+// are actually running with SIGPROF and the handler records their instruction pointers, which are
+// written out raw for offline symbolization. Enabled by setting LINKYTY_PC_PROFILE to a path.
+void StartPcSampler();
+
 struct Lifecycle {
 	static constexpr const char* name               = "Profiler";
 	static constexpr auto        initialize         = Profiler::Initialize;

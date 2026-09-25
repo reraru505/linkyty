@@ -14,6 +14,7 @@
 #include "loader/runtimeLinker.h"
 
 #include <atomic>
+#include <malloc.h>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -505,6 +506,316 @@ void BenchmarkEventQueuePingPong(uint64_t roundtrips) {
 
 } // namespace
 
+
+// ---------------------------------------------------------------------------
+// Guest memory bookkeeping
+// ---------------------------------------------------------------------------
+// Every mmap/munmap/VirtualQuery the guest performs mutates sorted-range vectors (insert/erase in
+// the middle) and builds temporary range vectors. These benchmarks price that path directly.
+// Values below are guest ABI constants, same as the VM allocation suite.
+namespace {
+
+constexpr int      SceKernelProtCpuRead = 0x01;
+constexpr int      SceKernelProtCpuRw   = 0x02;
+constexpr int      SceKernelMapFixed    = 0x10;
+constexpr int      SceKernelMtypeC      = 11;
+constexpr uint64_t SceKernelPageSize  = 0x4000;
+
+size_t RetainedHeapBytes() {
+	struct mallinfo2 info = ::mallinfo2();
+	return info.uordblks;
+}
+
+void PrintMemoryFootprint(size_t heap_before, size_t heap_after, uint64_t failures) {
+	const auto delta_kib =
+	    (static_cast<double>(heap_after) - static_cast<double>(heap_before)) / 1024.0;
+	std::printf("  Retained heap delta: %+.1f KiB\n", delta_kib);
+	if (failures != 0) {
+		std::printf("  Failures:            %" PRIu64 "\n", failures);
+	}
+}
+
+// reserve -> query -> munmap, the shape of a single guest allocation.
+void BenchmarkGuestRangeChurn(uint64_t iterations) {
+	std::printf("\n========================================================\n");
+	std::printf("Benchmark 7: Guest Range Churn (reserve+query+munmap, %lu ops)\n", iterations);
+	std::printf("========================================================\n");
+
+	uint64_t ops      = 0;
+	uint64_t failures = 0;
+	const auto heap_before = RetainedHeapBytes();
+	const auto start       = Clock::now();
+
+	for (uint64_t i = 0; i < iterations; i++) {
+		void* addr = nullptr;
+		if (Libs::LibKernel::Memory::KernelReserveVirtualRange(
+		        &addr, SceKernelPageSize, 0, SceKernelPageSize) != 0 ||
+		    addr == nullptr) {
+			failures++;
+			continue;
+		}
+		Libs::LibKernel::Memory::VirtualQueryInfo info {};
+		if (Libs::LibKernel::Memory::KernelVirtualQuery(addr, 0, &info, sizeof(info)) != 0) {
+			failures++;
+		}
+		if (Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(addr),
+		                                          SceKernelPageSize) != 0) {
+			failures++;
+		}
+		ops++;
+	}
+
+	const auto total_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+	                          Clock::now() - start)
+	                          .count();
+	if (ops == 0) {
+		std::printf("  no successful operations\n");
+		return;
+	}
+	std::printf("  Total Time:          %.3f ms\n", total_ms);
+	std::printf("  Latency per Pair:    %.1f ns\n", total_ms * 1e6 / static_cast<double>(ops));
+	std::printf("  Throughput:          %.2f K ops/sec\n",
+	            static_cast<double>(ops) / total_ms * 1000.0);
+	PrintMemoryFootprint(heap_before, RetainedHeapBytes(), failures);
+}
+
+// Allocate many ranges, free every other one, then refill: forces overlap splitting and merging.
+void BenchmarkGuestFragmentation(uint32_t count) {
+	constexpr uint64_t kSize = 64 * 1024;
+
+	std::printf("\n========================================================\n");
+	std::printf("Benchmark 8: Guest Fragmentation (%u x %" PRIu64 " KiB ranges)\n", count,
+	            kSize / 1024);
+	std::printf("========================================================\n");
+
+	std::vector<uint64_t> kept;
+	kept.reserve(count);
+	uint64_t allocated = 0;
+	uint64_t freed     = 0;
+	uint64_t refilled  = 0;
+	uint64_t failures  = 0;
+
+	const auto heap_before = RetainedHeapBytes();
+	const auto start       = Clock::now();
+
+	for (uint32_t i = 0; i < count; i++) {
+		void* addr = nullptr;
+		if (Libs::LibKernel::Memory::KernelReserveVirtualRange(&addr, kSize, 0, kSize) != 0 ||
+		    addr == nullptr) {
+			failures++;
+			continue;
+		}
+		kept.push_back(reinterpret_cast<uint64_t>(addr));
+		allocated++;
+	}
+
+	for (size_t i = 0; i + 1 < kept.size(); i += 2) {
+		if (Libs::LibKernel::Memory::KernelMunmap(kept[i], kSize) == 0) {
+			freed++;
+		} else {
+			failures++;
+		}
+		kept[i] = 0;
+	}
+
+	for (uint32_t i = 0; i < count; i++) {
+		void* addr = nullptr;
+		if (Libs::LibKernel::Memory::KernelReserveVirtualRange(&addr, kSize, 0, kSize) != 0 ||
+		    addr == nullptr) {
+			failures++;
+			continue;
+		}
+		refilled++;
+		Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(addr), kSize);
+	}
+
+	for (auto addr: kept) {
+		if (addr != 0) {
+			Libs::LibKernel::Memory::KernelMunmap(addr, kSize);
+		}
+	}
+
+	const auto total_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+	                          Clock::now() - start)
+	                          .count();
+	const auto ops = allocated + freed + refilled;
+	std::printf("  Total Time:          %.3f ms\n", total_ms);
+	std::printf("  Operations:          %" PRIu64 " (alloc %" PRIu64 ", free %" PRIu64
+	            ", refill %" PRIu64 ")\n",
+	            ops, allocated, freed, refilled);
+	if (ops != 0) {
+		std::printf("  Latency per Op:      %.1f ns\n", total_ms * 1e6 / static_cast<double>(ops));
+	}
+	PrintMemoryFootprint(heap_before, RetainedHeapBytes(), failures);
+}
+
+// VirtualQuery over an existing mapping: reads the sorted range vector and builds a result.
+void BenchmarkGuestQueryStorm(uint64_t iterations) {
+	constexpr uint64_t kSize = 16 * 1024 * 1024;
+
+	std::printf("\n========================================================\n");
+	std::printf("Benchmark 9: Guest VirtualQuery Storm (%lu queries)\n", iterations);
+	std::printf("========================================================\n");
+
+	void* base_raw = nullptr;
+	if (Libs::LibKernel::Memory::KernelReserveVirtualRange(&base_raw, kSize, 0, 1u << 20u) != 0 ||
+	    base_raw == nullptr) {
+		std::printf("  reservation failed\n");
+		return;
+	}
+	const auto base = reinterpret_cast<uint64_t>(base_raw);
+
+	uint64_t failures      = 0;
+	const auto heap_before = RetainedHeapBytes();
+	const auto start       = Clock::now();
+
+	for (uint64_t i = 0; i < iterations; i++) {
+		Libs::LibKernel::Memory::VirtualQueryInfo info {};
+		const auto address = reinterpret_cast<void*>(base + (i % 64u) * SceKernelPageSize);
+		if (Libs::LibKernel::Memory::KernelVirtualQuery(address, 0, &info, sizeof(info)) != 0) {
+			failures++;
+		}
+	}
+
+	const auto total_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+	                          Clock::now() - start)
+	                          .count();
+	std::printf("  Total Time:          %.3f ms\n", total_ms);
+	std::printf("  Latency per Query:   %.1f ns\n",
+	            total_ms * 1e6 / static_cast<double>(iterations));
+	std::printf("  Throughput:          %.2f K queries/sec\n",
+	            static_cast<double>(iterations) / total_ms * 1000.0);
+	PrintMemoryFootprint(heap_before, RetainedHeapBytes(), failures);
+
+	Libs::LibKernel::Memory::KernelMunmap(base, kSize);
+}
+
+// Physical direct memory: allocate/release pairs drive the pool's free map and block list.
+void BenchmarkDirectMemoryChurn(uint64_t iterations) {
+	constexpr uint64_t kChunk = 64 * 1024;
+
+	std::printf("\n========================================================\n");
+	std::printf("Benchmark 10: Guest Direct Memory Churn (allocate+release, %lu ops)\n",
+	            iterations);
+	std::printf("========================================================\n");
+
+	uint64_t ops           = 0;
+	uint64_t failures      = 0;
+	const auto heap_before = RetainedHeapBytes();
+	const auto start       = Clock::now();
+
+	for (uint64_t i = 0; i < iterations; i++) {
+		int64_t physical = -1;
+		if (Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+		        0, static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize()),
+		        kChunk, kChunk, SceKernelMtypeC, &physical) != 0) {
+			failures++;
+			continue;
+		}
+		if (Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, kChunk) != 0) {
+			failures++;
+		}
+		ops++;
+	}
+
+	const auto total_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+	                          Clock::now() - start)
+	                          .count();
+	if (ops == 0) {
+		std::printf("  no successful operations\n");
+		return;
+	}
+	std::printf("  Total Time:          %.3f ms\n", total_ms);
+	std::printf("  Latency per Pair:    %.1f ns\n", total_ms * 1e6 / static_cast<double>(ops));
+	std::printf("  Throughput:          %.2f K ops/sec\n",
+	            static_cast<double>(ops) / total_ms * 1000.0);
+	PrintMemoryFootprint(heap_before, RetainedHeapBytes(), failures);
+}
+
+
+// Protection changes walk the mapping list and rebuild it. This measures that cost as the number
+// of live mappings grows, which is what a streaming guest produces.
+void BenchmarkMappingProtectionScaling(uint64_t iterations) {
+	constexpr uint64_t kChunk = 64 * 1024;
+
+	std::printf("\n========================================================\n");
+	std::printf("Benchmark 11: Mapping Protection Scaling (%lu protects per size)\n", iterations);
+	std::printf("========================================================\n");
+
+	for (uint32_t mappings: {64u, 256u, 1024u}) {
+		const uint64_t arena_size = kChunk * mappings;
+		void*          arena_raw  = nullptr;
+		if (Libs::LibKernel::Memory::KernelReserveVirtualRange(&arena_raw, arena_size, 0, 1u << 20u) !=
+		        0 ||
+		    arena_raw == nullptr) {
+			std::printf("  mappings=%-5u reservation failed\n", mappings);
+			continue;
+		}
+		const auto arena = reinterpret_cast<uint64_t>(arena_raw);
+
+		std::vector<int64_t> physical;
+		physical.reserve(mappings);
+		uint32_t mapped   = 0;
+		uint32_t failures = 0;
+
+		for (uint32_t i = 0; i < mappings; i++) {
+			int64_t phys = -1;
+			if (Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+			        0, static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize()),
+			        kChunk, kChunk, SceKernelMtypeC, &phys) != 0) {
+				failures++;
+				continue;
+			}
+			void* at = reinterpret_cast<void*>(arena + i * kChunk);
+			if (Libs::LibKernel::Memory::KernelMapDirectMemory(&at, kChunk, SceKernelProtCpuRw,
+			                                                   SceKernelMapFixed, phys,
+			                                                   kChunk) != 0) {
+				Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys, kChunk);
+				failures++;
+				continue;
+			}
+			physical.push_back(phys);
+			mapped++;
+		}
+
+		if (mapped == 0) {
+			std::printf("  mappings=%-5u no mappings established\n", mappings);
+			Libs::LibKernel::Memory::KernelMunmap(arena, arena_size);
+			continue;
+		}
+
+		const auto heap_before = RetainedHeapBytes();
+		const auto start       = Clock::now();
+		for (uint64_t i = 0; i < iterations; i++) {
+			const auto index = static_cast<uint32_t>(i % mapped);
+			const auto prot  = (i & 1u) != 0 ? SceKernelProtCpuRead : SceKernelProtCpuRw;
+			if (Libs::LibKernel::Memory::KernelMprotect(
+			        reinterpret_cast<const void*>(arena + index * kChunk), kChunk, prot) != 0) {
+				failures++;
+			}
+		}
+		const auto total_ms =
+		    std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(Clock::now() -
+		                                                                          start)
+		        .count();
+
+		std::printf("  mappings=%-5u protects=%-8lu  %8.1f ns/protect   %6.3f ms total\n", mapped,
+		            static_cast<unsigned long>(iterations),
+		            total_ms * 1e6 / static_cast<double>(iterations), total_ms);
+		PrintMemoryFootprint(heap_before, RetainedHeapBytes(), failures);
+
+		for (uint32_t i = 0; i < mapped; i++) {
+			Libs::LibKernel::Memory::KernelMunmap(arena + i * kChunk, kChunk);
+		}
+		Libs::LibKernel::Memory::KernelMunmap(arena, arena_size);
+		for (auto phys: physical) {
+			Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys, kChunk);
+		}
+	}
+}
+
+} // namespace
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
 	Common::InitializeThreads();
 	std::printf("Initializing Kyty Subsystems for Synchronization Benchmark...\n");
@@ -542,6 +853,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
 
 	// 6. KernelEqueue user event round-trip ping-pong
 	BenchmarkEventQueuePingPong(50000);
+
+	// 7-10. Guest memory bookkeeping path
+	BenchmarkGuestRangeChurn(20000);
+	BenchmarkGuestFragmentation(256);
+	BenchmarkGuestQueryStorm(200000);
+	BenchmarkDirectMemoryChurn(20000);
+	BenchmarkMappingProtectionScaling(20000);
 
 	std::printf("\n========================================================\n");
 	std::printf("Synchronization Benchmark Complete.\n");
