@@ -184,7 +184,7 @@ Install the required development packages from your package manager:
 
 1. Clone the repository and initialize submodules:
    ```bash
-   git clone --recursive <your-repo-url>
+   git clone --recursive https://github.com/reraru505/linkyty.git
    cd linkyty
    ```
 
@@ -209,8 +209,10 @@ The compiled binary will be placed at `zig-out/bin/linkyty`.
 ## 🚀 Usage & Launcher Integration
 
 ### Command Line
+`--game` accepts either the game directory or the ELF directly:
 ```bash
 ./zig-out/bin/linkyty --game /path/to/game_directory --fullscreen
+./zig-out/bin/linkyty --game /path/to/game/eboot.bin --fullscreen
 ```
 
 Run `./zig-out/bin/linkyty --help` to view all available CLI flags (resolution, presentation modes, AMD instruction patching, Vulkan device index, and ETAHen cheat patches).
