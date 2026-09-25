@@ -5,6 +5,8 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <fmt/format.h>
@@ -170,6 +172,18 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (std::getenv("LINKYTY_DUMP_FAILED_IR") != nullptr) {
+			const auto path = fmt::format("failed_shader_{:016x}.ir.txt", m_program.shader_hash);
+			std::ofstream file(path);
+			if (file) {
+				file << ProgramToString(m_program);
+				LOGF("wrote failing shader IR to %s (reason: %s)\n", path.c_str(),
+				     reason.c_str());
+			} else {
+				LOGF("cannot write failing shader IR to %s (reason: %s)\n", path.c_str(),
+				     reason.c_str());
+			}
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -519,18 +533,41 @@ private:
 	}
 
 	bool MatchDenseTable(const Inst& handle, Inst*& heap_handle, const Inst*& based,
-	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices) {
+	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices,
+	                     uint32_t& record_base) {
 		for (uint32_t dword = 0; dword < handle.NumArgs(); dword++) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
 			    read->NumArgs() != 4u) {
+				m_indirect_reason =
+				    fmt::format("descriptor dword {} is not a scalar address load", dword);
 				return false;
 			}
 			uint32_t    memory_index = 0;
 			const auto* memory       = AddressReadMemory(*read, memory_index);
 			auto*       offset       = read->Arg(1).Resolve().TryInstruction();
-			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *read) ||
-			    offset == nullptr) {
+			if (memory == nullptr) {
+				const auto index = read->Flags<MemoryFlags>().index;
+				m_indirect_reason = fmt::format(
+				    "descriptor dword {} is not a 32-bit scalar address read (kind={} bits={} dwords={})",
+				    dword,
+				    index < m_program.memory_info.size()
+				        ? static_cast<uint32_t>(m_program.memory_info[index].kind)
+				        : UINT32_MAX,
+				    index < m_program.memory_info.size() ? m_program.memory_info[index].data_bits
+				                                         : 0u,
+				    index < m_program.memory_info.size() ? m_program.memory_info[index].data_dwords
+				                                         : 0u);
+				return false;
+			}
+			if (!MemoryIndexBelongsTo(memory_index, *read)) {
+				m_indirect_reason =
+				    fmt::format("descriptor dword {} shares its address read", dword);
+				return false;
+			}
+			if (offset == nullptr) {
+				m_indirect_reason =
+				    fmt::format("descriptor dword {} offset has no definition", dword);
 				return false;
 			}
 			uint32_t extra = 0;
@@ -540,6 +577,8 @@ private:
 				uint32_t    immediate = 0;
 				const Inst* inner     = nullptr;
 				if (offset->GetOpcode() != ValueOpcode::IAdd32 || offset->NumArgs() != 2u) {
+					m_indirect_reason = fmt::format(
+					    "descriptor dword {} offset is not the table index plus a constant", dword);
 					return false;
 				}
 				if (ImmediateU32(offset->Arg(1), immediate)) {
@@ -547,27 +586,53 @@ private:
 				} else if (ImmediateU32(offset->Arg(0), immediate)) {
 					inner = offset->Arg(1).Resolve().TryInstruction();
 				} else {
+					m_indirect_reason = fmt::format(
+					    "descriptor dword {} offset has no constant component", dword);
 					return false;
 				}
 				if (inner != based) {
+					m_indirect_reason =
+					    fmt::format("descriptor dword {} offset is not relative to the table", dword);
 					return false;
 				}
 				extra = immediate;
 			}
-			if (extra + memory->offset != dword * sizeof(uint32_t)) {
+			// The record base can sit at a non-zero byte offset of the heap; the descriptor
+			// loads carry it in their scalar-load metadata rather than in the IR address.
+			const auto byte = extra + memory->offset;
+			if (dword == 0u) {
+				record_base = byte;
+			} else if (byte != record_base + dword * sizeof(uint32_t)) {
+				m_indirect_reason = fmt::format(
+				    "descriptor dword {} covers record byte {} instead of {}", dword, byte,
+				    record_base + dword * sizeof(uint32_t));
 				return false;
 			}
 			auto* address = read->Arg(0).Resolve().TryInstruction();
-			if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
-			    (heap_handle != nullptr &&
-			     !EquivalentValue(m_program, Value(heap_handle), Value(address)))) {
+			if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource) {
+				m_indirect_reason =
+				    fmt::format("descriptor dword {} has no address resource", dword);
+				return false;
+			}
+			if (heap_handle != nullptr &&
+			    !EquivalentValue(m_program, Value(heap_handle), Value(address))) {
+				m_indirect_reason =
+				    fmt::format("descriptor dword {} uses a different address resource", dword);
 				return false;
 			}
 			heap_handle           = address;
 			reads[dword]          = read;
 			memory_indices[dword] = memory_index;
 		}
-		return based != nullptr && heap_handle != nullptr;
+		if (based == nullptr) {
+			m_indirect_reason = "descriptor loads have no common table offset";
+			return false;
+		}
+		if (heap_handle == nullptr) {
+			m_indirect_reason = "descriptor loads have no common address resource";
+			return false;
+		}
+		return true;
 	}
 
 	static bool IsBooleanOperator(ValueOpcode opcode) {
@@ -1076,26 +1141,34 @@ private:
 		const Inst*             based       = nullptr;
 		std::array<Inst*, 8>    reads {};
 		std::array<uint32_t, 8> memory_indices {};
-		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices)) {
+		uint32_t                record_base  = 0;
+		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices, record_base)) {
+			if (m_indirect_reason.empty()) {
+				m_indirect_reason = "descriptor loads are not a dense address table";
+			}
 			return false;
 		}
+		// The record index is shifted into the descriptor address. A non-zero table base shows up as
+		// an IAdd32 over that index; when the base is zero the load indexes with the shift itself.
 		uint32_t table_offset = 0;
-		Value    scaled_value;
-		if (based->GetOpcode() != ValueOpcode::IAdd32 || based->NumArgs() != 2u) {
-			return false;
+		Value    scaled_value = Value(const_cast<Inst*>(based));
+		if (based->GetOpcode() == ValueOpcode::IAdd32 && based->NumArgs() == 2u) {
+			if (ImmediateU32(based->Arg(1), table_offset)) {
+				scaled_value = based->Arg(0);
+			} else if (ImmediateU32(based->Arg(0), table_offset)) {
+				scaled_value = based->Arg(1);
+			} else {
+				m_indirect_reason = "descriptor table base is not a constant offset";
+				return false;
+			}
 		}
-		if (ImmediateU32(based->Arg(1), table_offset)) {
-			scaled_value = based->Arg(0);
-		} else if (ImmediateU32(based->Arg(0), table_offset)) {
-			scaled_value = based->Arg(1);
-		} else {
-			return false;
-		}
+		table_offset += record_base;
 		const auto* scaled = scaled_value.Resolve().TryInstruction();
 		uint32_t    shift  = 0;
 		if (scaled == nullptr || scaled->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
 		    scaled->NumArgs() != 2u || !ImmediateU32(scaled->Arg(1), shift) ||
 		    shift != DenseIndirectImageShift) {
+			m_indirect_reason = "descriptor table index is not a record index shifted by 5";
 			return false;
 		}
 		auto*    key          = scaled->Arg(0).Resolve().TryInstruction();
@@ -1103,6 +1176,7 @@ private:
 		Value    loop_bound;
 		bool     bound_signed = false;
 		if (key == nullptr) {
+			m_indirect_reason = "descriptor table index has no provenance";
 			return false;
 		}
 		uint32_t material_source = 0;
@@ -1114,6 +1188,11 @@ private:
 				bound = MaxDenseIndirectImageEntries;
 			} else if (!MatchReadLaneProbe(*key, pc, material_source, selector_offset,
 			                               selector_stride, item_bound, m_indirect_reason)) {
+				if (m_indirect_reason.empty()) {
+					m_indirect_reason = fmt::format(
+					    "descriptor table index {} has no provable bound",
+					    ValueOpcodeName(key->GetOpcode()));
+				}
 				return false;
 			}
 		}

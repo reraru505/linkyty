@@ -144,6 +144,13 @@ const Inst* MatchTableOffset(const Inst& index, uint32_t& stride_shift, uint32_t
 		based        = use.user;
 		table_offset = immediate;
 	}
+	if (based == nullptr) {
+		// The table base is folded into the descriptor load's immediate offset when it is zero, so
+		// the scaled lane index is used as the address directly.
+		scaled_out   = scaled;
+		table_offset = 0u;
+		based        = scaled;
+	}
 	return based;
 }
 

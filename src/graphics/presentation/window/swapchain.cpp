@@ -189,6 +189,10 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 
 	if (dst.image != nullptr) {
 		graphics.DeleteImage(dst);
+		// The next image may differ in size or format; stale view state would make the blit
+		// source a 1x1 region of the old image.
+		dst.state              = VulkanImageState {};
+		dst.subresource_states.clear();
 	}
 
 	vk::ImageCreateInfo create {};
@@ -207,6 +211,8 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
 		     extent.width, extent.height, static_cast<int>(format));
 	}
+	dst.extent = {extent.width, extent.height, 1};
+	dst.format = format;
 }
 
 void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
@@ -540,15 +546,7 @@ void Swapchain::Destroy() {
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
-#if defined(__APPLE__)
-		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
-		// window's view/layer and must run on the main thread on macOS.
-		EXIT_IF(!SDL_RunOnMainThread(
-		    [](void* window) { static_cast<WindowContext*>(window)->RecreateSurface(); },
-		    &m_window, true));
-#else
 		m_window.RecreateSurface();
-#endif
 	}
 	Create();
 }
