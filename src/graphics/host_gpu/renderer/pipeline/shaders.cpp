@@ -592,9 +592,7 @@ void CreatePipelineInternal(
 	vk::PipelineRasterizationStateCreateInfo rasterizer {};
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
-#if !defined(__APPLE__)
 	rasterizer.pNext = &clip_ext;
-#endif
 	rasterizer.cullMode  = cull_mode;
 	rasterizer.frontFace = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
@@ -641,9 +639,7 @@ void CreatePipelineInternal(
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
 	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
 	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if !defined(__APPLE__)
 	color_blending.pNext = &color_write;
-#endif
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
@@ -685,11 +681,7 @@ void CreatePipelineInternal(
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
 	depth_stencil_info.stencilTestEnable = (static_params.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.front.failOp      = static_params.stencil_front.failOp;
 	depth_stencil_info.front.passOp      = static_params.stencil_front.passOp;
@@ -716,11 +708,9 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
-#if !defined(__APPLE__)
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
-#endif
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}

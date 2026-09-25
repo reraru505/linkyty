@@ -31,37 +31,19 @@
 #include <utility>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#if defined(_M_X64) || defined(__x86_64__)
-#include <intrin.h>
-#endif
-#include <windows.h>
-#endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif
 
 #include <pthread.h>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <fmt/format.h>
-#include <pthread_time.h>
-#elif !defined(__APPLE__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#endif
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <csignal> // pthread_kill is declared here, not in <pthread.h>
-#endif
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+#if defined(__x86_64__)
 #include <x86intrin.h>
 #endif
 
@@ -120,18 +102,10 @@ static constexpr int KERNEL_PTHREAD_MUTEX_RECURSIVE  = 2;
 static constexpr int KERNEL_PTHREAD_MUTEX_NORMAL     = 3;
 static constexpr int KERNEL_PTHREAD_MUTEX_ADAPTIVE   = 4;
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // OS-level thread id reported to the guest.
 static uint64_t GetHostThreadId() {
-#if defined(__APPLE__)
-	uint64_t tid = 0;
-	pthread_threadid_np(nullptr, &tid);
-	return tid;
-#else
 	return static_cast<uint64_t>(::syscall(SYS_gettid));
-#endif
 }
-#endif
 
 static uint64_t KernelReadTscNative() {
 #if defined(_M_X64) || defined(__x86_64__)
@@ -209,127 +183,6 @@ static void KernelUsToTimespec(uint64_t us, KernelTimespec* tp) {
 	tp->tv_nsec = static_cast<int64_t>((us % 1000000) * 1000);
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static uint64_t KernelFiletimeTo100ns(FILETIME ft) {
-	ULARGE_INTEGER v {};
-	v.LowPart  = ft.dwLowDateTime;
-	v.HighPart = ft.dwHighDateTime;
-	return v.QuadPart;
-}
-
-static void Kernel100nsToTimespec(uint64_t value, KernelTimespec* tp) {
-	EXIT_IF(tp == nullptr);
-	tp->tv_sec  = static_cast<int64_t>(value / 10000000);
-	tp->tv_nsec = static_cast<int64_t>((value % 10000000) * 100);
-}
-
-static bool KernelRealtimeToTimespec(bool precise, KernelTimespec* tp) {
-	EXIT_IF(tp == nullptr);
-
-	FILETIME ft {};
-	if (precise) {
-		GetSystemTimePreciseAsFileTime(&ft);
-	} else {
-		GetSystemTimeAsFileTime(&ft);
-	}
-
-	static constexpr uint64_t WINDOWS_UNIX_EPOCH_DELTA_100NS = 116444736000000000ULL;
-	const auto                value                          = KernelFiletimeTo100ns(ft);
-	if (value < WINDOWS_UNIX_EPOCH_DELTA_100NS) {
-		return false;
-	}
-
-	Kernel100nsToTimespec(value - WINDOWS_UNIX_EPOCH_DELTA_100NS, tp);
-	return true;
-}
-
-static bool KernelMonotonicToTimespec(KernelTimespec* tp) {
-	EXIT_IF(tp == nullptr);
-
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	if (frequency == 0) {
-		return false;
-	}
-
-	const auto counter = Common::Timer::QueryPerformanceCounter();
-	tp->tv_sec         = static_cast<int64_t>(counter / frequency);
-	tp->tv_nsec        = static_cast<int64_t>(((counter % frequency) * 1000000000ull) / frequency);
-	return true;
-}
-
-static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp, int* error) {
-	EXIT_IF(tp == nullptr);
-	EXIT_IF(error == nullptr);
-
-	if (clock_id == KERNEL_CLOCK_PROCTIME) {
-		KernelUsToTimespec(KernelGetProcessTimeUsNative(), tp);
-		return true;
-	}
-
-	FILETIME create_time {};
-	FILETIME exit_time {};
-	FILETIME kernel_time {};
-	FILETIME user_time {};
-
-	switch (clock_id) {
-		case KERNEL_CLOCK_REALTIME:
-		case KERNEL_CLOCK_REALTIME_PRECISE:
-			if (!KernelRealtimeToTimespec(true, tp)) {
-				*error = KERNEL_ERROR_EFAULT;
-			}
-			return true;
-		case KERNEL_CLOCK_REALTIME_FAST:
-		case KERNEL_CLOCK_SECOND:
-			if (!KernelRealtimeToTimespec(false, tp)) {
-				*error = KERNEL_ERROR_EFAULT;
-			}
-			if (clock_id == KERNEL_CLOCK_SECOND) {
-				tp->tv_nsec = 0;
-			}
-			return true;
-		case KERNEL_CLOCK_MONOTONIC:
-		case KERNEL_CLOCK_UPTIME:
-		case KERNEL_CLOCK_UPTIME_PRECISE:
-		case KERNEL_CLOCK_UPTIME_FAST:
-		case KERNEL_CLOCK_MONOTONIC_PRECISE:
-		case KERNEL_CLOCK_MONOTONIC_FAST:
-		case KERNEL_CLOCK_EXT_NETWORK:
-		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
-		case KERNEL_CLOCK_EXT_AD_NETWORK:
-		case KERNEL_CLOCK_EXT_RAW_NETWORK:
-			if (!KernelMonotonicToTimespec(tp)) {
-				*error = KERNEL_ERROR_EFAULT;
-			}
-			return true;
-		case KERNEL_CLOCK_THREAD_CPUTIME_ID:
-			if (!GetThreadTimes(GetCurrentThread(), &create_time, &exit_time, &kernel_time,
-			                    &user_time)) {
-				*error = KERNEL_ERROR_EFAULT;
-				return true;
-			}
-			Kernel100nsToTimespec(
-			    KernelFiletimeTo100ns(kernel_time) + KernelFiletimeTo100ns(user_time), tp);
-			return true;
-		case KERNEL_CLOCK_VIRTUAL:
-			if (!GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time,
-			                     &user_time)) {
-				*error = KERNEL_ERROR_EFAULT;
-				return true;
-			}
-			Kernel100nsToTimespec(KernelFiletimeTo100ns(user_time), tp);
-			return true;
-		case KERNEL_CLOCK_PROF:
-			if (!GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time,
-			                     &user_time)) {
-				*error = KERNEL_ERROR_EFAULT;
-				return true;
-			}
-			Kernel100nsToTimespec(KernelFiletimeTo100ns(kernel_time), tp);
-			return true;
-		default: return false;
-	}
-}
-#else
 static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp, int* error) {
 	EXIT_IF(tp == nullptr);
 	EXIT_IF(error == nullptr);
@@ -341,7 +194,6 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 
 	return false;
 }
-#endif
 
 enum MutexState : uint32_t {
 	MUTEX_UNLOCKED  = 0,
@@ -408,10 +260,6 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t guest_host_gs8;
-	uintptr_t guest_host_gs10;
-#endif
 };
 
 static PthreadAttrPrivate* GetPthreadAttrValue(const PthreadAttr* attr, const char* func_name) {
@@ -511,13 +359,7 @@ void PthreadWakeForSignal(Pthread thread) {
 void KernelDispatchPendingSignalForCurrentThread();
 
 static void SchedulerBackoffOnce() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (SwitchToThread() == 0) {
-		Sleep(0);
-	}
-#else
 	std::this_thread::yield();
-#endif
 }
 
 static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
@@ -855,59 +697,16 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 
 	if (g_pthread_self != nullptr) {
 		g_pthread_self->guest_host_rbx = host_rbx;
-#if defined(__APPLE__)
-		g_pthread_self->guest_host_rsp = host_rsp - (2u * sizeof(uint64_t));
-#else
 		g_pthread_self->guest_host_rsp = host_rsp - (4u * sizeof(uint64_t));
-#endif
 		g_pthread_self->guest_host_rbp = host_rbp;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		uintptr_t host_gs8  = 0;
-		uintptr_t host_gs10 = 0;
-		asm volatile("movq %%gs:0x08, %0\n\t"
-		             "movq %%gs:0x10, %1\n\t"
-		             : "=r"(host_gs8), "=r"(host_gs10)
-		             :
-		             : "memory");
-		g_pthread_self->guest_host_gs8  = host_gs8;
-		g_pthread_self->guest_host_gs10 = host_gs10;
-#endif
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
-#if defined(__APPLE__)
-	// Keep inputs out of r12/r13.
-	register uintptr_t guest_rsp_reg asm("r14") = guest_rsp;
-	register uintptr_t guest_rbp_reg asm("r15") = guest_rbp;
-	asm volatile("pushq %%r12\n\t"
-	             "pushq %%r13\n\t"
-	             "movq %%rsp, %%r12\n\t"
-	             "movq %%rbp, %%r13\n\t"
-	             "movq %[guest_rsp], %%rsp\n\t"
-	             "movq %[guest_rbp], %%rbp\n\t"
-	             "callq *%%rsi\n\t"
-	             "movq %%r13, %%rbp\n\t"
-	             "movq %%r12, %%rsp\n\t"
-	             "popq %%r13\n\t"
-	             "popq %%r12\n\t"
-	             : "=a"(ret), "+D"(arg), "+S"(func)
-	             : [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
-#else
 	// PthreadExit resumes at this frame, so all four saved registers stay on the host stack.
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "pushq %%r14\n\t"
 	             "pushq %%r15\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             "movq %%gs:0x08, %%r14\n\t"
-	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
-#endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
 	             "movq %[guest_rsp], %%rsp\n\t"
@@ -915,36 +714,21 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "callq *%%rsi\n\t"
 	             "movq %%r13, %%rbp\n\t"
 	             "movq %%r12, %%rsp\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             "movq %%r14, %%gs:0x08\n\t"
-	             "movq %%r15, %%gs:0x10\n\t"
-#endif
 	             "popq %%r15\n\t"
 	             "popq %%r14\n\t"
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
-#else
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "xmm0",
 	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
 	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
-#endif
-#endif
 
 	g_guest_entry_return_rsp = 0;
 	if (g_pthread_self != nullptr) {
 		g_pthread_self->guest_host_rbx = 0;
 		g_pthread_self->guest_host_rsp = 0;
 		g_pthread_self->guest_host_rbp = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		g_pthread_self->guest_host_gs8  = 0;
-		g_pthread_self->guest_host_gs10 = 0;
-#endif
 	}
 
 	return ret;
@@ -959,27 +743,6 @@ static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 		return;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	ULONG_PTR low  = 0;
-	ULONG_PTR high = 0;
-	GetCurrentThreadStackLimits(&low, &high);
-
-	if (low != 0 && high > low) {
-		(*attr)->stack_addr = reinterpret_cast<void*>(low);
-		(*attr)->stack_size = high - low;
-		(*attr)->stack_user = true;
-	}
-#elif defined(__APPLE__)
-	// macOS reports a stack top and size.
-	void*        top  = pthread_get_stackaddr_np(pthread_self());
-	const size_t size = pthread_get_stacksize_np(pthread_self());
-
-	if (top != nullptr && size != 0) {
-		(*attr)->stack_addr = static_cast<void*>(static_cast<uint8_t*>(top) - size);
-		(*attr)->stack_size = size;
-		(*attr)->stack_user = true;
-	}
-#else
 	// Record the main thread's stack bounds.
 	pthread_attr_t self_attr {};
 	if (pthread_getattr_np(pthread_self(), &self_attr) == 0) {
@@ -992,7 +755,6 @@ static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 		}
 		pthread_attr_destroy(&self_attr);
 	}
-#endif
 }
 
 static void FreeDetachedThreads(void* /*arg*/) {
@@ -1016,11 +778,9 @@ void PthreadDeleteStaticObjects(Loader::Program* program) {
 void PthreadInitSelfForMainThread() {
 	EXIT_IF(g_pthread_self != nullptr);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {
 		EXIT("Failed to initialize the thread signal stack\n");
 	}
-#endif
 
 	g_pthread_self = new PthreadPrivate {};
 	PthreadAttrInit(&g_pthread_self->attr);
@@ -1036,11 +796,7 @@ void PthreadInitSelfForMainThread() {
 	g_pthread_self->arg             = nullptr;
 
 	uint64_t os_thread_id = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
-#else
 	os_thread_id = GetHostThreadId();
-#endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
 
@@ -1198,16 +954,10 @@ static constexpr int32_t DST_NONE = 0;
 static constexpr int32_t DST_MET  = 4;
 
 static int32_t GetDstSeconds() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	TIME_ZONE_INFORMATION tzi {};
-	const DWORD           result = GetTimeZoneInformation(&tzi);
-	return (result == TIME_ZONE_ID_DAYLIGHT ? -tzi.DaylightBias * 60 : 0);
-#else
 	const std::time_t now = std::time(nullptr);
 	std::tm           local_tm {};
 	localtime_r(&now, &local_tm);
 	return (local_tm.tm_isdst > 0 ? 3600 : 0);
-#endif
 }
 
 static bool GetPosixClockId(KernelClockid clock_id, clockid_t* out) {
@@ -2254,20 +2004,6 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		return KERNEL_ERROR_EINVAL;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
-		pparam.sched_priority = +2;
-	} else if (param->sched_priority >= 733) {
-		pparam.sched_priority = -2;
-	} else {
-		pparam.sched_priority = 0;
-	}
-
-	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-#endif
 
 	attr_value->guest_priority = param->sched_priority;
 	return OK;
@@ -2758,12 +2494,7 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 		return KERNEL_ERROR_EINVAL;
 	}
 
-#if defined(__APPLE__)
-	(void)pclock_id;
-	int result = 0;
-#else
 	int result = pthread_condattr_setclock(&(*attr)->p, pclock_id);
-#endif
 	(*attr)->clock_id = clock_id;
 
 	LOGF("\tcondattr setclock: clock_id = %d, native = %d, result = %d\n", clock_id,
@@ -3107,7 +2838,6 @@ uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Raise a host signal on another guest thread.
 bool PthreadKillHost(Pthread thread, int host_signal) {
 	if (thread == nullptr || thread->free) {
@@ -3116,7 +2846,6 @@ bool PthreadKillHost(Pthread thread, int host_signal) {
 
 	return ::pthread_kill(thread->p, host_signal) == 0;
 }
-#endif
 
 void PthreadQueuePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
@@ -3215,11 +2944,9 @@ static void CleanupThread(void* arg) {
 
 static void* RunThread(void* arg) {
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {
 		EXIT("Failed to initialize the thread signal stack\n");
 	}
-#endif
 
 	auto* thread = static_cast<Pthread>(arg);
 	void* ret    = nullptr;
@@ -3229,11 +2956,7 @@ static void* RunThread(void* arg) {
 	g_pthread_self = thread;
 
 	uint64_t os_thread_id = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
-#else
 	os_thread_id = GetHostThreadId();
-#endif
 	thread->host_thread_id = os_thread_id;
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
@@ -3519,19 +3242,6 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
-		param.sched_priority = +2;
-	} else if (prio >= 733) {
-		param.sched_priority = -2;
-	} else {
-		param.sched_priority = 0;
-	}
-
-	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-#endif
 
 	thread->attr->guest_priority = prio;
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
@@ -3556,28 +3266,15 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 			const auto host_rbx = g_pthread_self->guest_host_rbx;
 			const auto host_rsp = g_pthread_self->guest_host_rsp;
 			const auto host_rbp = g_pthread_self->guest_host_rbp;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			const auto host_gs8  = g_pthread_self->guest_host_gs8;
-			const auto host_gs10 = g_pthread_self->guest_host_gs10;
-#endif
 
 			asm volatile("movq %2, %%rbx\n\t"
 			             "movq %3, %%r12\n\t"
 			             "movq %4, %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			             "movq %5, %%r14\n\t"
-			             "movq %6, %%r15\n\t"
-#endif
 			             "movq %0, %%rax\n\t"
 			             "movq %1, %%rsp\n\t"
 			             "retq\n\t"
 			             :
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp),
-			               "m"(host_gs8), "m"(host_gs10)
-#else
 			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp)
-#endif
 			             : "rax", "memory");
 			__builtin_unreachable();
 		}
@@ -3719,24 +3416,12 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	}
 
 	int result = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	FILETIME ft {};
-	GetSystemTimePreciseAsFileTime(&ft);
-	uint64_t ticks = ft.dwHighDateTime;
-	ticks <<= 32;
-	ticks |= ft.dwLowDateTime;
-	ticks /= 10;
-	ticks -= 11644473600000000ULL;
-	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
-	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
-#else
 	struct timespec ts {};
 	result = ::clock_gettime(CLOCK_REALTIME, &ts);
 	if (result == 0) {
 		tp->tv_sec  = static_cast<int64_t>(ts.tv_sec);
 		tp->tv_usec = static_cast<int64_t>(ts.tv_nsec / 1000);
 	}
-#endif
 
 	if (result == 0) {
 		return OK;
@@ -3751,13 +3436,6 @@ int KYTY_SYSV_ABI KernelGettimezone(KernelTimezone* tz) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	TIME_ZONE_INFORMATION tzi {};
-	const DWORD           result = GetTimeZoneInformation(&tzi);
-
-	tz->tz_minuteswest = tzi.Bias;
-	tz->tz_dsttime     = (result == TIME_ZONE_ID_UNKNOWN ? DST_NONE : DST_MET);
-#else
 	const std::time_t now = std::time(nullptr);
 	std::tm           local_tm {};
 	std::tm           utc_tm {};
@@ -3768,7 +3446,6 @@ int KYTY_SYSV_ABI KernelGettimezone(KernelTimezone* tz) {
 
 	tz->tz_minuteswest = static_cast<int32_t>((utc - local) / 60);
 	tz->tz_dsttime     = (local_tm.tm_isdst > 0 ? DST_MET : DST_NONE);
-#endif
 
 	return OK;
 }
@@ -4470,6 +4147,4 @@ int KYTY_SYSV_ABI pthread_getstack(const LibKernel::PthreadAttr* __restrict attr
 
 } // namespace Libs
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #pragma GCC diagnostic pop
-#endif

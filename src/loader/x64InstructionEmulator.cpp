@@ -5,19 +5,11 @@
 #include <Zydis/Zydis.h>
 #include <bit>
 #include <cstring>
-#if !defined(__APPLE__)
 #include <emmintrin.h>
 #include <xmmintrin.h>
-#endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <windows.h> // IWYU pragma: keep
-#elif defined(__APPLE__)
-#include <sys/ucontext.h>
-#else
 #include <sched.h>
 #include <ucontext.h>
-#endif
 
 namespace Loader::X64InstructionEmulator {
 
@@ -400,68 +392,6 @@ static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const 
 
 // Keep instruction semantics shared; only access to the saved host context differs.
 struct Context {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	PCONTEXT native;
-
-	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
-	void                   Advance(size_t length) { native->Rip += length; }
-	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
-
-	void LoadGprs(uint64_t (&gpr)[16]) const {
-		const uint64_t registers[] = {native->Rax, native->Rcx, native->Rdx, native->Rbx,
-		                              native->Rsp, native->Rbp, native->Rsi, native->Rdi,
-		                              native->R8,  native->R9,  native->R10, native->R11,
-		                              native->R12, native->R13, native->R14, native->R15};
-		std::memcpy(gpr, registers, sizeof(gpr));
-	}
-
-	void ClearUpperYmm(uint8_t index) const {
-		if ((native->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
-			return;
-		}
-		DWORD64 features = 0;
-		if (!GetXStateFeaturesMask(native, &features) || (features & XSTATE_MASK_AVX) == 0) {
-			return; // An absent AVX component restores zeroes.
-		}
-		DWORD size = 0;
-		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
-		if (ymm != nullptr && size >= (index + 1u) * sizeof(M128A)) {
-			ymm[index] = {};
-		}
-	}
-#elif defined(__APPLE__)
-	ucontext_t* native;
-
-	[[nodiscard]] uint64_t Rip() const {
-		return static_cast<uint64_t>(native->uc_mcontext->__ss.__rip);
-	}
-	void Advance(size_t length) {
-		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
-	}
-	// Darwin names the XMM file __fpu_xmm0..__fpu_xmm15 instead of exposing an array.
-	[[nodiscard]] void* Xmm(uint8_t index) const {
-		auto* fs = &native->uc_mcontext->__fs;
-		switch (index) {
-			case 0: return &fs->__fpu_xmm0;
-			case 1: return &fs->__fpu_xmm1;
-			case 2: return &fs->__fpu_xmm2;
-			case 3: return &fs->__fpu_xmm3;
-			case 4: return &fs->__fpu_xmm4;
-			case 5: return &fs->__fpu_xmm5;
-			case 6: return &fs->__fpu_xmm6;
-			case 7: return &fs->__fpu_xmm7;
-			case 8: return &fs->__fpu_xmm8;
-			case 9: return &fs->__fpu_xmm9;
-			case 10: return &fs->__fpu_xmm10;
-			case 11: return &fs->__fpu_xmm11;
-			case 12: return &fs->__fpu_xmm12;
-			case 13: return &fs->__fpu_xmm13;
-			case 14: return &fs->__fpu_xmm14;
-			case 15: return &fs->__fpu_xmm15;
-			default: return nullptr;
-		}
-	}
-#else
 	ucontext_t* native;
 
 	[[nodiscard]] uint64_t Rip() const {
@@ -506,10 +436,8 @@ struct Context {
 			std::memset(state + 576 + index * 16, 0, 16);
 		}
 	}
-#endif
 };
 
-#if !defined(__APPLE__)
 
 static bool TryEmulateShaNi(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -558,7 +486,6 @@ static bool TryEmulateShaNi(Context& context) {
 	return true;
 }
 
-#endif
 
 static bool TryEmulateSse4a(Context& context) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -624,7 +551,6 @@ static bool TryEmulateSse4a(Context& context) {
 	return true;
 }
 
-#if !defined(__APPLE__)
 
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -634,11 +560,7 @@ static bool TryEmulateMonitorxMwaitx(Context& context) {
 
 	// Approximate AMD MONITORX/MWAITX as no-op/yield.
 	if (rip[2] == 0xfb) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		SwitchToThread();
-#else
 		::sched_yield();
-#endif
 	}
 	context.Advance(3);
 	return true;
@@ -711,7 +633,6 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
-#endif
 
 bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
                             const ZydisDecodedOperand* operands) {
@@ -723,7 +644,6 @@ bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
 
 uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 	uint64_t patched = 0;
-#if !defined(__APPLE__)
 	ZydisDecoder decoder {};
 	if (!ZYAN_SUCCESS(
 	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
@@ -746,10 +666,6 @@ uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 		}
 		offset += instruction.length;
 	}
-#else
-	(void)address;
-	(void)size;
-#endif
 	return patched;
 }
 
@@ -757,26 +673,12 @@ bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
 		return false;
 	}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	Context context {static_cast<PCONTEXT>(native_context)};
-#elif defined(__APPLE__)
-	auto* saved_context = static_cast<ucontext_t*>(native_context);
-	if (saved_context->uc_mcontext == nullptr) {
-		return false;
-	}
-	Context context {saved_context};
-#else
 	Context context {static_cast<ucontext_t*>(native_context)};
-#endif
-#if !defined(__APPLE__)
 	if (TryEmulateReciprocalSquareRoot(context)) {
 		return true;
 	}
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
-#else
-	return TryEmulateSse4a(context);
-#endif
 }
 
 } // namespace Loader::X64InstructionEmulator

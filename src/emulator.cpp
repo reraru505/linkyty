@@ -34,15 +34,7 @@ namespace Emulator {
 static void PrintSystemInfo() {
 	const Common::SystemInfo info = Common::GetSystemInfo();
 
-#if defined(__APPLE__)
-	static constexpr auto platform_name = "macOS";
-#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static constexpr auto platform_name = "Windows";
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	static constexpr auto platform_name = "Linux";
-#else
-	static constexpr auto platform_name = "Unknown";
-#endif
 
 	LOGF("Build\n"
 	     "  version: %s\n\n"

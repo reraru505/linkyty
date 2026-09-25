@@ -197,7 +197,6 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 	     (key.repeat ? "repeat" : ""), key.scan_code, key.key_code, key.mod);
 #endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
 			case SDLK_F1:
@@ -221,7 +220,6 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 		}
 	}
 
-#endif
 
 	const bool fullscreen_key_event =
 	    fullscreen_key != SDLK_UNKNOWN && key.key_code == fullscreen_key;
@@ -738,12 +736,10 @@ static void WindowCreate(WindowContext& context) {
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	// RenderDoc can hide Wayland Vulkan surface support; prefer X11 for captures.
 	if (Config::RenderDocEnabled()) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 	}
-#endif
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
@@ -751,31 +747,6 @@ static void WindowCreate(WindowContext& context) {
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
-#if defined(__APPLE__)
-	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
-	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
-	// override, and fall back to SDL's normal loader search when no bundle is present.
-	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
-		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
-			const std::string base_path_str = base_path;
-			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
-			if (!Common::File::IsFileExisting(moltenvk_path)) {
-				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
-			}
-			if (Common::File::IsFileExisting(moltenvk_path) &&
-			    SDL_setenv_unsafe("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
-				LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
-			}
-		}
-	}
-
-	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
-	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
-	// borderless window skips that machinery entirely.
-	if (std::getenv("KYTY_BORDERLESS") != nullptr) {
-		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
-	}
-#endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {

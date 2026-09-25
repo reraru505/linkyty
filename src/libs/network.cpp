@@ -1,18 +1,3 @@
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <windows.h>
-#include <iphlpapi.h>
-#include <ws2tcpip.h>
-#ifdef s_addr
-#undef s_addr
-#endif
-#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -20,7 +5,6 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#endif
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -836,17 +820,10 @@ struct NetEtherAddr {
 	uint8_t data[6] = {0};
 };
 
-#if defined(_WIN32)
-using NativeSocket                                  = SOCKET;
-static constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
-using SocketLength                                  = int;
-using SocketIoLength                                = int;
-#else
 using NativeSocket                                  = int;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
 using SocketLength                                  = socklen_t;
 using SocketIoLength                                = size_t;
-#endif
 
 struct SocketTransport {
 	explicit SocketTransport(NativeSocket value): socket(value) {}
@@ -856,11 +833,7 @@ struct SocketTransport {
 			return 0;
 		}
 		const auto value = std::exchange(socket, INVALID_NATIVE_SOCKET);
-#if defined(_WIN32)
-		return closesocket(value);
-#else
 		return ::close(value);
-#endif
 	}
 	NativeSocket socket;
 };
@@ -934,15 +907,6 @@ static void RemoveSocketFromEpolls(int id) {
 }
 
 static bool EnsureSocketBackend() {
-#if defined(_WIN32)
-	if (!g_winsock_initialized.load()) {
-		WSADATA data {};
-		if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-			return false;
-		}
-		g_winsock_initialized = true;
-	}
-#endif
 	return true;
 }
 
@@ -956,39 +920,6 @@ static int ConvertHostSocketError(int error) {
 		return 0;
 	}
 	int posix_error = Posix::POSIX_EIO;
-#if defined(_WIN32)
-	switch (error) {
-		case WSAEACCES: posix_error = Posix::POSIX_EACCES; break;
-		case WSAEADDRINUSE: posix_error = Posix::POSIX_EADDRINUSE; break;
-		case WSAEADDRNOTAVAIL: posix_error = Posix::POSIX_EADDRNOTAVAIL; break;
-		case WSAEAFNOSUPPORT: posix_error = Posix::POSIX_EAFNOSUPPORT; break;
-		case WSAEFAULT: posix_error = Posix::POSIX_EFAULT; break;
-		case WSAEINTR: posix_error = Posix::POSIX_EINTR; break;
-		case WSAEINVAL: posix_error = Posix::POSIX_EINVAL; break;
-		case WSAEISCONN: posix_error = Posix::POSIX_EISCONN; break;
-		case WSAEMFILE: posix_error = Posix::POSIX_EMFILE; break;
-		case WSAEMSGSIZE: posix_error = Posix::POSIX_EMSGSIZE; break;
-		case WSAENOBUFS: posix_error = Posix::POSIX_ENOBUFS; break;
-		case WSAENETDOWN: posix_error = Posix::POSIX_ENETDOWN; break;
-		case WSAENETRESET: posix_error = Posix::POSIX_ENETRESET; break;
-		case WSAENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
-		case WSAENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
-		case WSAENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
-		case WSAEOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
-		case WSAEPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
-		case WSAESHUTDOWN: posix_error = Posix::POSIX_ESHUTDOWN; break;
-		case WSAETIMEDOUT: posix_error = Posix::POSIX_ETIMEDOUT; break;
-		case WSAEWOULDBLOCK: posix_error = Posix::POSIX_EWOULDBLOCK; break;
-		case WSAECONNABORTED: posix_error = Posix::POSIX_ECONNABORTED; break;
-		case WSAECONNREFUSED: posix_error = Posix::POSIX_ECONNREFUSED; break;
-		case WSAECONNRESET: posix_error = Posix::POSIX_ECONNRESET; break;
-		case WSAEDESTADDRREQ: posix_error = Posix::POSIX_EDESTADDRREQ; break;
-		case WSAEHOSTUNREACH: posix_error = Posix::POSIX_EHOSTUNREACH; break;
-		case WSAEINPROGRESS: posix_error = Posix::POSIX_EINPROGRESS; break;
-		case WSAEALREADY: posix_error = Posix::POSIX_EALREADY; break;
-		default: break;
-	}
-#else
 	switch (error) {
 		case EACCES: posix_error = Posix::POSIX_EACCES; break;
 		case EADDRINUSE: posix_error = Posix::POSIX_EADDRINUSE; break;
@@ -1006,16 +937,11 @@ static int ConvertHostSocketError(int error) {
 		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
 		default: break;
 	}
-#endif
 	return posix_error;
 }
 
 static int SetHostSocketError() {
-#if defined(_WIN32)
-	return SetGuestSocketError(ConvertHostSocketError(WSAGetLastError()));
-#else
 	return SetGuestSocketError(ConvertHostSocketError(errno));
-#endif
 }
 
 static int ConvertFamily(int family) {
@@ -1057,14 +983,12 @@ static int ConvertMessageFlags(int flags) {
 	if ((flags & guest_msg_waitall) != 0) {
 		host_flags |= MSG_WAITALL;
 	}
-#if !defined(_WIN32)
 	if ((flags & guest_msg_dontwait) != 0) {
 		host_flags |= MSG_DONTWAIT;
 	}
 	if ((flags & guest_msg_nosignal) != 0) {
 		host_flags |= MSG_NOSIGNAL;
 	}
-#endif
 
 	flags &= ~(guest_msg_peek | guest_msg_dontroute | guest_msg_waitall | guest_msg_dontwait |
 	           guest_msg_nosignal);
@@ -1403,11 +1327,7 @@ int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
 
 	LOGF("\t src = %.46s\n", src);
 
-#if defined(_WIN32)
-	const int result = ::InetPtonA(host_family, src, dst);
-#else
 	const int result = ::inet_pton(host_family, src, dst);
-#endif
 	return result < 0 ? NET_ERROR_EINVAL : result;
 }
 
@@ -1422,16 +1342,9 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 		return nullptr;
 	}
 
-#if defined(_WIN32)
-	const int win_af = (af == 28 ? AF_INET6 : AF_INET);
-	if (::InetNtopA(win_af, const_cast<void*>(src), dst, size) == nullptr) {
-		return nullptr;
-	}
-#else
 	if (::inet_ntop(af, src, dst, size) == nullptr) {
 		return nullptr;
 	}
-#endif
 
 	return dst;
 }
@@ -1605,16 +1518,10 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 		if (!GetSocketBackend(registration.id, &socket, &state)) {
 			continue;
 		}
-#if defined(_WIN32)
-		if (host_registrations.size() >= FD_SETSIZE) {
-			return SetGuestSocketError(Posix::POSIX_EINVAL);
-		}
-#else
 		if (socket >= FD_SETSIZE) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
 		host_nfds = std::max(host_nfds, socket + 1);
-#endif
 		if ((registration.event.events & EPOLL_IN) != 0) {
 			FD_SET(socket, &host_read);
 		}
@@ -1741,12 +1648,7 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	auto transport = std::make_shared<SocketTransport>(socket);
 	if (p2p) {
 		// Logical sockets keep their own blocking mode; the shared transport never blocks.
-#if defined(_WIN32)
-		u_long    enabled = 1;
-		const int result  = ioctlsocket(socket, FIONBIO, &enabled);
-#else
 		const int result = ::fcntl(socket, F_SETFL, O_NONBLOCK);
-#endif
 		if (result != 0) {
 			return SetHostSocketError();
 		}
@@ -1960,16 +1862,8 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 		return -1;
 	}
 
-#if defined(_WIN32)
-	if (::shutdown(socket, how) == SOCKET_ERROR) {
-		return SetHostSocketError();
-	}
-
-	return 0;
-#else
 	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
 	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
@@ -2033,11 +1927,9 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 
 	// Guest socket options: SOL_SOCKET=0xffff, SO_ERROR=0x1007.
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-#if !defined(_WIN32)
 	if (!socket_error) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
-#endif
 	if (socket_error) {
 		optname = SO_ERROR;
 	}
@@ -2097,24 +1989,12 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
-#if defined(_WIN32)
-	constexpr int ORBIS_SO_NBIO = 0x1200;
-	if (ConvertSocketOptionLevel(level) == SOL_SOCKET && optname == ORBIS_SO_NBIO &&
-	    optlen >= sizeof(int)) {
-		u_long enabled = (*static_cast<const int*>(optval) != 0 ? 1 : 0);
-		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
-			return SetHostSocketError();
-		}
-		return 0;
-	}
-#else
 	// Guest TCP options: IPPROTO_TCP=6, TCP_NODELAY=1.
 	if (level != 6 || optname != 1) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
 	level   = IPPROTO_TCP;
 	optname = TCP_NODELAY;
-#endif
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
 	                 static_cast<const char*>(optval), static_cast<SocketLength>(optlen)) != 0) {
@@ -2219,12 +2099,6 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
 		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
 	}
-#if defined(_WIN32)
-	if (result < 0 && WSAGetLastError() == WSAEMSGSIZE) {
-		// Winsock copied the datagram prefix; POSIX reports its length as success.
-		result = host_len;
-	}
-#endif
 	if (result < 0) {
 		return SetHostSocketError();
 	}
@@ -2283,26 +2157,16 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			continue;
 		}
 		NativeSocket socket = INVALID_NATIVE_SOCKET;
-#if !defined(_WIN32)
 		if (fd < 3) {
 			socket = fd;
 		} else
-#endif
 		if (!GetSocketBackend(fd, &socket)) {
 			return -1;
 		}
-#if defined(_WIN32)
-		if ((read && host_read.fd_count == FD_SETSIZE) ||
-		    (write && host_write.fd_count == FD_SETSIZE) ||
-		    (except && host_except.fd_count == FD_SETSIZE)) {
-			return SetGuestSocketError(Posix::POSIX_EINVAL);
-		}
-#else
 		if (socket >= FD_SETSIZE) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
 		host_nfds = std::max(host_nfds, socket + 1);
-#endif
 		descriptors.emplace_back(fd, socket);
 		if (read) {
 			FD_SET(socket, &host_read);
@@ -2329,12 +2193,6 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	}
 
 	int result = 0;
-#if defined(_WIN32)
-	if (descriptors.empty()) {
-		Sleep(host_timeout_ptr == nullptr ? INFINITE :
-		      static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
-	} else
-#endif
 	{
 		result = ::select(host_nfds, readfds != nullptr ? &host_read : nullptr,
 		                  writefds != nullptr ? &host_write : nullptr,
@@ -3174,115 +3032,21 @@ struct HostNetworkInfo {
 };
 
 static void CopyIpv4String(char* dst, size_t dst_size, const sockaddr* addr) {
-#if defined(_WIN32)
-	if (dst == nullptr || dst_size == 0 || addr == nullptr || addr->sa_family != AF_INET) {
-		return;
-	}
-
-	const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
-	inet_ntop(AF_INET, &in->sin_addr, dst, static_cast<socklen_t>(dst_size));
-#else
 	(void)dst;
 	(void)dst_size;
 	(void)addr;
-#endif
 }
 
 static void CopyIpv4Netmask(char* dst, size_t dst_size, uint8_t prefix_len) {
-#if defined(_WIN32)
-	if (dst == nullptr || dst_size == 0 || prefix_len > 32) {
-		return;
-	}
-
-	const uint32_t mask = (prefix_len == 0 ? 0 : (0xffffffffu << (32u - prefix_len)));
-	in_addr        in {};
-	in.S_un.S_addr = htonl(mask);
-	inet_ntop(AF_INET, &in, dst, static_cast<socklen_t>(dst_size));
-#else
 	(void)dst;
 	(void)dst_size;
 	(void)prefix_len;
-#endif
 }
 
 static HostNetworkInfo QueryHostNetworkInfo() {
 	HostNetworkInfo info;
-#if defined(_WIN32)
-	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
-	ULONG size  = 0;
-	auto  ret   = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &size);
-	if (ret != ERROR_BUFFER_OVERFLOW || size == 0) {
-		return info;
-	}
-
-	std::vector<uint8_t> buffer(size);
-	auto*                adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
-	ret = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, adapters, &size);
-	if (ret != NO_ERROR) {
-		return info;
-	}
-
-	for (auto* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
-		if (adapter->OperStatus != IfOperStatusUp || adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
-		    adapter->IfType == IF_TYPE_TUNNEL) {
-			continue;
-		}
-
-		for (auto* unicast = adapter->FirstUnicastAddress; unicast != nullptr;
-		     unicast       = unicast->Next) {
-			const auto* addr = unicast->Address.lpSockaddr;
-			if (addr == nullptr) {
-				continue;
-			}
-			if (addr->sa_family == AF_INET) {
-				const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
-				const auto  ip = ntohl(in->sin_addr.S_un.S_addr);
-				if ((ip & 0xff000000u) != 0x7f000000u && ip != 0) {
-					info.connected = true;
-					info.wireless  = (adapter->IfType == IF_TYPE_IEEE80211);
-					if (adapter->PhysicalAddressLength >= sizeof(info.ether_addr.data)) {
-						std::memcpy(info.ether_addr.data, adapter->PhysicalAddress,
-						            sizeof(info.ether_addr.data));
-					}
-					CopyIpv4String(info.ip_address, sizeof(info.ip_address), addr);
-					CopyIpv4Netmask(info.netmask, sizeof(info.netmask),
-					                unicast->OnLinkPrefixLength);
-					if (adapter->FirstGatewayAddress != nullptr) {
-						CopyIpv4String(info.default_route, sizeof(info.default_route),
-						               adapter->FirstGatewayAddress->Address.lpSockaddr);
-					}
-					int dns_index = 0;
-					for (auto* dns = adapter->FirstDnsServerAddress; dns != nullptr;
-					     dns       = dns->Next) {
-						if (dns->Address.lpSockaddr != nullptr &&
-						    dns->Address.lpSockaddr->sa_family == AF_INET) {
-							CopyIpv4String(dns_index == 0 ? info.primary_dns : info.secondary_dns,
-							               dns_index == 0 ? sizeof(info.primary_dns)
-							                              : sizeof(info.secondary_dns),
-							               dns->Address.lpSockaddr);
-							dns_index++;
-							if (dns_index >= 2) {
-								break;
-							}
-						}
-					}
-					return info;
-				}
-			} else if (addr->sa_family == AF_INET6) {
-				const auto* in6 = reinterpret_cast<const sockaddr_in6*>(addr);
-				if (!IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) &&
-				    !IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr)) {
-					info.connected = true;
-				}
-			}
-		}
-	}
-
-	return info;
-#else
 	info.connected = true;
 	return info;
-#endif
 }
 
 static bool NetCtlConnected() {

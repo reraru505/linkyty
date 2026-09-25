@@ -1,12 +1,6 @@
 #ifndef KYTY_COMMON_CONFIG_H_
 #define KYTY_COMMON_CONFIG_H_
 
-#define KYTY_PLATFORM_WINDOWS 1
-#define KYTY_PLATFORM_LINUX   5
-#ifndef KYTY_PLATFORM
-#define KYTY_PLATFORM         KYTY_PLATFORM_LINUX
-#endif
-
 #define KYTY_COMPILER_GCC     1
 #define KYTY_COMPILER_CLANG   2
 #if defined(__clang__)

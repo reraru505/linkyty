@@ -121,9 +121,7 @@ bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size);
 #endif
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
-#endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();
 

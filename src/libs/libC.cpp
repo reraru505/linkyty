@@ -385,15 +385,9 @@ static KYTY_SYSV_ABI GuestTm* libc_gmtime(const int64_t* timer) {
 	std::tm              host_result {};
 	const auto           t = static_cast<std::time_t>(*timer);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (_gmtime64_s(&host_result, &t) != 0) {
-		return nullptr;
-	}
-#else
 	if (gmtime_r(&t, &host_result) == nullptr) {
 		return nullptr;
 	}
-#endif
 
 	result = ToGuestTm(host_result);
 	return &result;
@@ -408,15 +402,9 @@ static KYTY_SYSV_ABI GuestTm* libc_localtime(const int64_t* timer) {
 	std::tm              host_result {};
 	const auto           t = static_cast<std::time_t>(*timer);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (_localtime64_s(&host_result, &t) != 0) {
-		return nullptr;
-	}
-#else
 	if (localtime_r(&t, &host_result) == nullptr) {
 		return nullptr;
 	}
-#endif
 
 	result = ToGuestTm(host_result);
 	return &result;
@@ -429,11 +417,7 @@ static KYTY_SYSV_ABI int64_t libc_mktime(GuestTm* timeptr) {
 
 	auto host_time = ToHostTm(*timeptr);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const auto result = static_cast<int64_t>(_mktime64(&host_time));
-#else
 	const auto result = static_cast<int64_t>(std::mktime(&host_time));
-#endif
 
 	*timeptr = ToGuestTm(host_time);
 	return result;

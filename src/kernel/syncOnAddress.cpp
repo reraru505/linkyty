@@ -12,12 +12,10 @@
 #include <mutex>
 #include <unordered_map>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 #include <cerrno>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#endif
 
 namespace Libs::LibKernel::SyncOnAddress {
 
@@ -81,7 +79,6 @@ void PollSignals(signal_poll_func_t signal_poll) {
 	}
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 
 template <typename T>
 int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
@@ -134,7 +131,6 @@ int WakeLinux(volatile void* address, int32_t count) {
 	return result < 0 ? KERNEL_ERROR_EINVAL : OK;
 }
 
-#endif
 
 struct PortableWaiter {
 	Common::CondVar condition;
@@ -261,11 +257,7 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 	}
 
 	int result = OK;
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	result = WaitLinux(address, expected, deadline, signal_poll);
-#else
-	result = WaitPortable(address, expected, deadline, signal_poll);
-#endif
 	PollSignals(signal_poll);
 	return result;
 }
@@ -292,9 +284,7 @@ int Wake(volatile void* address, int32_t count) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	return WakeLinux(address, count);
-#endif
 	return WakePortable(address, count);
 }
 

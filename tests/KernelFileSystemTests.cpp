@@ -454,11 +454,9 @@ void CheckSocketWakeup() {
         "guest PEEK and WAITALL preserve the wake bytes");
   Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
         "consume wake bytes with guest WAITALL");
-#if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
-#endif
   Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
         "close wake sockets");
   readable[reader / 64] = bit;

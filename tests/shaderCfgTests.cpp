@@ -46,11 +46,9 @@
 #include <unordered_set>
 #include <vector>
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
 
 namespace Libs::Graphics {
 namespace {
@@ -62,7 +60,6 @@ void Check(bool value, const char *text) {
   }
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 template <typename Function>
 void ExpectFatal(Function function, const char *text) {
   const pid_t pid = ::fork();
@@ -80,7 +77,6 @@ void ExpectFatal(Function function, const char *text) {
   Check(waited == pid, "waitpid failed while collecting fatal shader test");
   Check(WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff), text);
 }
-#endif
 
 ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
   static const ShaderVertexInputInfo vertex{};
@@ -1328,7 +1324,6 @@ void TestSpirvRequirementsAnalysis() {
             !compute_requirements.pixel_valid_mask,
         "stage-specific SPIR-V requirements leaked into compute");
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal(
       [&] {
         program.stage = ShaderType::Pixel;
@@ -1343,7 +1338,6 @@ void TestSpirvRequirementsAnalysis() {
         ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
       },
       "invalid export requirement metadata did not terminate analysis");
-#endif
 
   Program add_tid;
   add_tid.stage = ShaderType::Compute;
@@ -1368,7 +1362,6 @@ void TestSpirvRequirementsAnalysis() {
             !add_tid_requirements.subgroup_shuffle,
         "buffer ADD_TID requested the wrong subgroup contract");
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal(
       [&] {
         add_tid.memory_info[0].resource = 1;
@@ -1381,7 +1374,6 @@ void TestSpirvRequirementsAnalysis() {
         ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
       },
       "graphics buffer ADD_TID did not terminate requirements analysis");
-#endif
 
   Program empty;
   const auto empty_requirements =
@@ -4121,12 +4113,10 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
   Check((text.find(opcode_name) != std::string::npos),
         "decoder unsupported text did not include opcode name");
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   ExpectFatal([&] { (void)RecompileForTest(code, options); },
               "unsupported opcode did not terminate shader compilation");
-#endif
 }
 
 void TestScalarAshrI64Decoder() {
@@ -4657,7 +4647,6 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   options.wave_size = 64u;
   options.input_info.compute = &compute;
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   store.pc = 0u;
   store.family = Decoder::Family::VOP1;
   store.opcode = Decoder::Opcode::UNKNOWN;
@@ -4686,7 +4675,6 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   store.src_count = 1u;
   ExpectFatal([&] { (void)Frontend::TranslateProgram(decoded, cfg, options); },
               "invalid V_MOVRELS_B32 operands did not terminate compilation");
-#endif
 
   store = {};
   store.family = Decoder::Family::SOP1;
@@ -6332,7 +6320,6 @@ void TestPixelAncillaryLayerInput() {
   Check(SpirvSourceHasInstructionUsing(sample_source, "OpLoad", "%int %gl_SampleID"),
         "sample index was not loaded from its scalar integer input");
   CheckSpirvBinaryValidates(sample_result.spirv);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   shader[1] = EncodeVop3Word1(5 + 256, 128 + 12, 128 + 4);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "unsupported live ancillary field was silently replaced");
@@ -6341,7 +6328,6 @@ void TestPixelAncillaryLayerInput() {
   shader[5] = EncodeExp1(6, 7, 5, 0);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "direct raw ancillary export was silently replaced after field lowering");
-#endif
 }
 
 void TestGraphicsCreateInterpolantMapping() {
@@ -7681,7 +7667,6 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
@@ -7722,7 +7707,6 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
               "self-modifying vector-buffer descriptor did not terminate "
               "compilation");
 }
-#endif
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
@@ -10531,19 +10515,15 @@ void TestDeferredSpirvPhiPatching() {
   const auto result = builder.AllocateId();
   const auto phi = builder.AddDeferredPhi(type, result, 2);
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { (void)builder.Build(); }, "unpatched phi was serialized");
   ExpectFatal([&] { builder.PatchDeferredPhi(phi, 2, one, right); },
               "phi patch accepted an incoming outside its encoded length");
-#endif
 
   builder.PatchDeferredPhi(phi, 1, one, right);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { builder.PatchDeferredPhi(phi, 1, zero, left); },
               "phi incoming was patched twice");
   ExpectFatal([&] { (void)builder.Build(); },
               "partially patched phi was serialized");
-#endif
 
   // Appending another instruction must not change the first phi's patch
   // location.
@@ -10782,7 +10762,6 @@ void TestTypedEntryStateIsMinimal() {
   check(64u);
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestFinalSsaRejectsRegisterStatePseudos() {
   using namespace ShaderRecompiler::IR;
 
@@ -10804,7 +10783,6 @@ void TestFinalSsaRejectsRegisterStatePseudos() {
   check_rejected(false);
   check_rejected(true);
 }
-#endif
 
 void TestValuePhiValidation() {
   using namespace ShaderRecompiler::IR;
@@ -10819,11 +10797,9 @@ void TestValuePhiValidation() {
     AfterInstruction,
   };
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const auto expect_invalid = [](const Program &program, const char *text) {
     ExpectFatal([&] { ValidateProgram(program, true); }, text);
   };
-#endif
   const auto validate = [&](InvalidPhi invalid) {
     Program program;
     const auto add_block = [&](uint32_t id) {
@@ -10875,16 +10851,13 @@ void TestValuePhiValidation() {
     if (invalid == InvalidPhi::None) {
       ValidateProgram(program, true);
     }
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     else {
       expect_invalid(program,
                      "malformed Phi did not terminate IR validation");
     }
-#endif
   };
 
   validate(InvalidPhi::None);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   validate(InvalidPhi::Empty);
   validate(InvalidPhi::MissingParent);
   validate(InvalidPhi::DuplicateParent);
@@ -11098,7 +11071,6 @@ void TestValuePhiValidation() {
                    "non-dominating branch condition did not terminate IR "
                    "validation");
   }
-#endif
 }
 
 void TestU64ShiftConstantPropagation() {
@@ -11139,7 +11111,6 @@ void TestU64ShiftConstantPropagation() {
   }
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNativeWideValueValidation() {
   using namespace ShaderRecompiler::IR;
 
@@ -11418,7 +11389,6 @@ void TestNativeWideValueValidation() {
     check_rejected(program, "invalid export-info index was accepted");
   }
 }
-#endif
 
 void TestNewShaderRecompilerZeroInitialRegisterState() {
   const uint32_t shader[] = {
@@ -12026,7 +11996,6 @@ void TestNewShaderRecompilerNativeBindingPlan() {
         "SPIR-V resources do not all use descriptor set zero");
   CheckSpirvBinaryValidates(result.spirv);
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal(
       [&] {
         auto malformed = RecompileForTest(shader, options);
@@ -12060,7 +12029,6 @@ void TestNewShaderRecompilerNativeBindingPlan() {
                                                    options.input_info);
       },
       "invalid dense buffer resource did not terminate SPIR-V emission");
-#endif
 }
 
 void BuildTypedPlan(const uint32_t *code, uint32_t words,
@@ -13201,7 +13169,6 @@ void TestCompilerStageInputOwnership() {
         "compilation reinterpreted the translated program's identity");
   CheckSpirvBinaryValidates(compiled.spirv);
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   options.stage = ShaderType::Vertex;
   options.input_info.vertex = nullptr;
   ExpectFatal([&] { (void)TranslateProgram(shader, options); },
@@ -13225,7 +13192,6 @@ void TestCompilerStageInputOwnership() {
   ExpectFatal(
       [&] { (void)Frontend::TranslateProgram(decoded, cfg, invalid_fetch); },
       "embedded vertex fetch accepted another stage's metadata");
-#endif
 }
 
 void TestSpirvEmissionOwnsRequirements() {
@@ -13575,10 +13541,8 @@ int main() {
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
-#endif
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
@@ -13631,14 +13595,10 @@ int main() {
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
   TestTypedEntryStateIsMinimal();
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();
-#endif
   TestValuePhiValidation();
   TestU64ShiftConstantPropagation();
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
-#endif
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
   TestNewShaderRecompilerVertexExportUsesInvocationExecMask();

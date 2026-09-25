@@ -203,10 +203,8 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	// Close host files opened before a failed descriptor setup.
 	m_files[index]->f.Close();
-#endif
 
 	delete m_files[index];
 	m_files[index] = nullptr;
@@ -279,7 +277,6 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 	}
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Resolve guest paths case-insensitively on case-sensitive hosts.
 static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
 	std::error_code ec;
@@ -324,11 +321,6 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 
 	return resolved;
 }
-#else
-static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
-	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
-}
-#endif
 
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
@@ -347,15 +339,7 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
-			         mounted_name.c_str());
-		}
-		return p.dir / native_rel_path;
-#else
 		return ResolvePathIgnoringCase(p.dir / native_rel_path);
-#endif
 	}
 
 	return mounted_name;

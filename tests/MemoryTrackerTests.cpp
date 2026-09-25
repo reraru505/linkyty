@@ -15,20 +15,11 @@
 #include <utility>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#undef min
-#undef max
-#else
 #include <csignal>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
 
 namespace {
 
@@ -45,7 +36,6 @@ void Check(bool value, const char *text) {
   }
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 using DWORD = uint32_t;
 constexpr uint32_t PAGE_NOACCESS = 1;
 constexpr uint32_t PAGE_READONLY = 2;
@@ -123,13 +113,6 @@ int VirtualProtect(void *address, size_t size, uint32_t protection,
   }
   return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
 }
-#else
-uint32_t Protection(const void *address) {
-  MEMORY_BASIC_INFORMATION info{};
-  Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
-  return info.Protect;
-}
-#endif
 
 bool IsWritable(const void *address) {
   return Protection(address) == PAGE_READWRITE;
@@ -803,29 +786,6 @@ void TestFullRegionGpuUnmarkBatching() {
 }
 
 void CheckDeathCase(const char *name) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  char path[MAX_PATH]{};
-  Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
-        "GetModuleFileName failed");
-  std::string command = std::string("\"") + path + "\" --death " + name;
-  std::vector<char> mutable_command(command.begin(), command.end());
-  mutable_command.push_back('\0');
-  STARTUPINFOA startup{sizeof(startup)};
-  PROCESS_INFORMATION process{};
-  Check(CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                       &process) != 0,
-        "CreateProcess failed");
-  Check(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
-        "MemoryTracker death test timed out");
-  DWORD exit_code = 0;
-  Check(
-      GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
-          (exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
-      "MemoryTracker death path used the wrong exit");
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-#else
   const pid_t pid = ::fork();
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
@@ -838,7 +798,6 @@ void CheckDeathCase(const char *name) {
       WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff);
   Check(fatal_exit || WIFSIGNALED(status),
         "MemoryTracker death path used the wrong exit");
-#endif
 }
 
 void TestFatalPaths() {
@@ -847,7 +806,6 @@ void TestFatalPaths() {
   }
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 void *g_fault_stack = nullptr;
 constexpr size_t FAULT_STACK_SIZE = 64 * 1024;
 volatile sig_atomic_t g_stack_faults = 0;
@@ -907,7 +865,6 @@ void TestFaultOnProtectedStack() {
             WEXITSTATUS(status) == 0,
         "fault on a protected stack did not recover");
 }
-#endif
 
 } // namespace
 
@@ -940,9 +897,7 @@ int main(int argc, char **argv) {
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
-#endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;
 }

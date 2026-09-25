@@ -35,20 +35,9 @@
 #include <thread>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <csignal>
-#include <pthread.h>
-#include <sys/ucontext.h>
-#else
 #include <csignal>
 #include <pthread.h>
 #include <ucontext.h>
-#endif
 
 namespace Libs {
 
@@ -509,7 +498,6 @@ bool KernelIsDispatchingSignalOnCurrentThread() {
 	return g_dispatching_signal_handler;
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 static void WaitForSignalDispatch(Pthread thread, int signum) {
 	constexpr auto DISPATCH_WAIT_STEP = std::chrono::microseconds(1000);
 	constexpr auto DISPATCH_WAIT_MAX  = std::chrono::milliseconds(2);
@@ -520,7 +508,6 @@ static void WaitForSignalDispatch(Pthread thread, int signum) {
 		waited += DISPATCH_WAIT_STEP;
 	}
 }
-#endif
 
 struct SignalMcontext {
 	uint64_t mc_onstack;
@@ -582,47 +569,9 @@ static_assert(offsetof(SignalMcontext, mc_rip) == 0xa0);
 static_assert(offsetof(SignalUcontext, uc_mcontext) + offsetof(SignalMcontext, mc_rsp) == 0xf8);
 
 static SignalUcontext CreateSignalUcontext(
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-    const CONTEXT* source_ctx = nullptr
-#endif
 ) {
 	SignalUcontext ctx = {};
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	CONTEXT host_ctx = {};
-	if (source_ctx != nullptr) {
-		host_ctx = *source_ctx;
-	} else {
-		host_ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
-		RtlCaptureContext(&host_ctx);
-	}
-
-	ctx.uc_mcontext.mc_r8     = host_ctx.R8;
-	ctx.uc_mcontext.mc_r9     = host_ctx.R9;
-	ctx.uc_mcontext.mc_r10    = host_ctx.R10;
-	ctx.uc_mcontext.mc_r11    = host_ctx.R11;
-	ctx.uc_mcontext.mc_r12    = host_ctx.R12;
-	ctx.uc_mcontext.mc_r13    = host_ctx.R13;
-	ctx.uc_mcontext.mc_r14    = host_ctx.R14;
-	ctx.uc_mcontext.mc_r15    = host_ctx.R15;
-	ctx.uc_mcontext.mc_rdi    = host_ctx.Rdi;
-	ctx.uc_mcontext.mc_rsi    = host_ctx.Rsi;
-	ctx.uc_mcontext.mc_rbp    = host_ctx.Rbp;
-	ctx.uc_mcontext.mc_rbx    = host_ctx.Rbx;
-	ctx.uc_mcontext.mc_rdx    = host_ctx.Rdx;
-	ctx.uc_mcontext.mc_rax    = host_ctx.Rax;
-	ctx.uc_mcontext.mc_rcx    = host_ctx.Rcx;
-	ctx.uc_mcontext.mc_rsp    = host_ctx.Rsp;
-	ctx.uc_mcontext.mc_rip    = host_ctx.Rip;
-	ctx.uc_mcontext.mc_cs     = host_ctx.SegCs;
-	ctx.uc_mcontext.mc_fs     = host_ctx.SegFs;
-	ctx.uc_mcontext.mc_gs     = host_ctx.SegGs;
-	ctx.uc_mcontext.mc_ss     = host_ctx.SegSs;
-	ctx.uc_mcontext.mc_ds     = host_ctx.SegDs;
-	ctx.uc_mcontext.mc_es     = host_ctx.SegEs;
-	ctx.uc_mcontext.mc_rflags = host_ctx.EFlags;
-	ctx.uc_mcontext.mc_len    = sizeof(SignalMcontext);
-#else
 	ctx.uc_mcontext.mc_len = sizeof(SignalMcontext);
 	uint64_t stack_marker  = 0;
 	ctx.uc_mcontext.mc_rsp = reinterpret_cast<uint64_t>(&stack_marker);
@@ -696,7 +645,6 @@ static SignalUcontext CreateSignalUcontext(
 	ctx.uc_mcontext.mc_rflags = rflags;
 	ctx.uc_mcontext.mc_cs     = cs;
 	ctx.uc_mcontext.mc_ss     = ss;
-#endif
 #endif
 
 	return ctx;
@@ -799,40 +747,8 @@ static void SanitizeNonGuestSignalUcontext(SignalUcontext* ctx, Pthread thread) 
 	ctx->uc_mcontext.mc_rip = 0;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static void ApplySignalUcontext(CONTEXT* dst_ctx, const SignalUcontext& src_ctx) {
-	if (dst_ctx == nullptr) {
-		return;
-	}
 
-	dst_ctx->R8     = src_ctx.uc_mcontext.mc_r8;
-	dst_ctx->R9     = src_ctx.uc_mcontext.mc_r9;
-	dst_ctx->R10    = src_ctx.uc_mcontext.mc_r10;
-	dst_ctx->R11    = src_ctx.uc_mcontext.mc_r11;
-	dst_ctx->R12    = src_ctx.uc_mcontext.mc_r12;
-	dst_ctx->R13    = src_ctx.uc_mcontext.mc_r13;
-	dst_ctx->R14    = src_ctx.uc_mcontext.mc_r14;
-	dst_ctx->R15    = src_ctx.uc_mcontext.mc_r15;
-	dst_ctx->Rdi    = src_ctx.uc_mcontext.mc_rdi;
-	dst_ctx->Rsi    = src_ctx.uc_mcontext.mc_rsi;
-	dst_ctx->Rbp    = src_ctx.uc_mcontext.mc_rbp;
-	dst_ctx->Rbx    = src_ctx.uc_mcontext.mc_rbx;
-	dst_ctx->Rdx    = src_ctx.uc_mcontext.mc_rdx;
-	dst_ctx->Rax    = src_ctx.uc_mcontext.mc_rax;
-	dst_ctx->Rcx    = src_ctx.uc_mcontext.mc_rcx;
-	dst_ctx->Rsp    = src_ctx.uc_mcontext.mc_rsp;
-	dst_ctx->Rip    = src_ctx.uc_mcontext.mc_rip;
-	dst_ctx->SegCs  = static_cast<DWORD>(src_ctx.uc_mcontext.mc_cs);
-	dst_ctx->SegFs  = src_ctx.uc_mcontext.mc_fs;
-	dst_ctx->SegGs  = src_ctx.uc_mcontext.mc_gs;
-	dst_ctx->SegSs  = static_cast<DWORD>(src_ctx.uc_mcontext.mc_ss);
-	dst_ctx->SegDs  = src_ctx.uc_mcontext.mc_ds;
-	dst_ctx->SegEs  = src_ctx.uc_mcontext.mc_es;
-	dst_ctx->EFlags = static_cast<DWORD>(src_ctx.uc_mcontext.mc_rflags);
-}
-#endif
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && defined(__x86_64__)
+#if defined(__x86_64__)
 
 static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	SignalUcontext ctx = {};
@@ -840,34 +756,6 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 		return ctx;
 	}
 
-#if defined(__APPLE__)
-	const auto& ss = host_ctx->uc_mcontext->__ss;
-
-	ctx.uc_mcontext.mc_rdi    = ss.__rdi;
-	ctx.uc_mcontext.mc_rsi    = ss.__rsi;
-	ctx.uc_mcontext.mc_rdx    = ss.__rdx;
-	ctx.uc_mcontext.mc_rcx    = ss.__rcx;
-	ctx.uc_mcontext.mc_r8     = ss.__r8;
-	ctx.uc_mcontext.mc_r9     = ss.__r9;
-	ctx.uc_mcontext.mc_rax    = ss.__rax;
-	ctx.uc_mcontext.mc_rbx    = ss.__rbx;
-	ctx.uc_mcontext.mc_rbp    = ss.__rbp;
-	ctx.uc_mcontext.mc_r10    = ss.__r10;
-	ctx.uc_mcontext.mc_r11    = ss.__r11;
-	ctx.uc_mcontext.mc_r12    = ss.__r12;
-	ctx.uc_mcontext.mc_r13    = ss.__r13;
-	ctx.uc_mcontext.mc_r14    = ss.__r14;
-	ctx.uc_mcontext.mc_r15    = ss.__r15;
-	ctx.uc_mcontext.mc_rip    = ss.__rip;
-	ctx.uc_mcontext.mc_rsp    = ss.__rsp;
-	ctx.uc_mcontext.mc_rflags = ss.__rflags;
-	ctx.uc_mcontext.mc_cs     = ss.__cs & 0xffffu;
-	ctx.uc_mcontext.mc_gs     = static_cast<uint16_t>(ss.__gs & 0xffffu);
-	ctx.uc_mcontext.mc_fs     = static_cast<uint16_t>(ss.__fs & 0xffffu);
-	ctx.uc_mcontext.mc_len    = sizeof(SignalMcontext);
-
-	return ctx;
-#else
 	const auto* gregs = host_ctx->uc_mcontext.gregs;
 
 	ctx.uc_mcontext.mc_rdi    = static_cast<uint64_t>(gregs[REG_RDI]);
@@ -897,7 +785,6 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	ctx.uc_mcontext.mc_len = sizeof(SignalMcontext);
 
 	return ctx;
-#endif
 }
 
 static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext& src_ctx) {
@@ -905,29 +792,6 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 		return;
 	}
 
-#if defined(__APPLE__)
-	auto& ss = dst_ctx->uc_mcontext->__ss;
-
-	ss.__rdi    = src_ctx.uc_mcontext.mc_rdi;
-	ss.__rsi    = src_ctx.uc_mcontext.mc_rsi;
-	ss.__rdx    = src_ctx.uc_mcontext.mc_rdx;
-	ss.__rcx    = src_ctx.uc_mcontext.mc_rcx;
-	ss.__r8     = src_ctx.uc_mcontext.mc_r8;
-	ss.__r9     = src_ctx.uc_mcontext.mc_r9;
-	ss.__rax    = src_ctx.uc_mcontext.mc_rax;
-	ss.__rbx    = src_ctx.uc_mcontext.mc_rbx;
-	ss.__rbp    = src_ctx.uc_mcontext.mc_rbp;
-	ss.__r10    = src_ctx.uc_mcontext.mc_r10;
-	ss.__r11    = src_ctx.uc_mcontext.mc_r11;
-	ss.__r12    = src_ctx.uc_mcontext.mc_r12;
-	ss.__r13    = src_ctx.uc_mcontext.mc_r13;
-	ss.__r14    = src_ctx.uc_mcontext.mc_r14;
-	ss.__r15    = src_ctx.uc_mcontext.mc_r15;
-	ss.__rip    = src_ctx.uc_mcontext.mc_rip;
-	ss.__rsp    = src_ctx.uc_mcontext.mc_rsp;
-	ss.__rflags = src_ctx.uc_mcontext.mc_rflags;
-	// Segment selectors are left untouched; XNU validates them on sigreturn.
-#else
 	auto* gregs = dst_ctx->uc_mcontext.gregs;
 
 	gregs[REG_RDI] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rdi);
@@ -950,17 +814,10 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 	gregs[REG_EFL] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rflags);
 
 	// The kernel validates packed segment selectors on sigreturn.
-#endif
 }
 
 static int SignalDispatchHostSignal() {
-#if defined(__APPLE__)
-	// macOS has no realtime signals; SIGUSR1 is otherwise unused on the host side (the
-	// guest's SIGUSR1 is an emulated signal number, not a host registration).
-	static const int host_signal = SIGUSR1;
-#else
 	static const int host_signal = SIGRTMIN + 3;
-#endif
 	return host_signal;
 }
 
@@ -1008,60 +865,6 @@ static bool EnsureHostSignalDispatchInstalled() {
 
 #endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-enum KytyQueueUserApcFlags : ULONG_PTR {
-	KytyQueueUserApcFlagsNone            = 0,
-	KytyQueueUserApcFlagsSpecialUserApc  = 1,
-	KytyQueueUserApcFlagsCallbackContext = 0x00010000,
-	KytyQueueUserApcFlagsMaxValue        = 2,
-};
-
-union KytyUserApcOption {
-	ULONG_PTR UserApcFlags;
-	HANDLE    MemoryReserveHandle;
-};
-
-using KytyPsApcRoutine = void (*)(void* apc_arg1, void* apc_arg2, void* apc_arg3, PCONTEXT context);
-using NtQueueApcThreadExFunc = uint64_t(WINAPI*)(HANDLE thread, KytyUserApcOption option,
-                                                 KytyPsApcRoutine routine, void* arg1, void* arg2,
-                                                 void* arg3);
-
-static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
-	static auto* nt_queue_apc_thread_ex = reinterpret_cast<NtQueueApcThreadExFunc>(
-	    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueueApcThreadEx"));
-	return nt_queue_apc_thread_ex;
-}
-
-static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
-	auto*      thread = static_cast<Pthread>(arg1);
-	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!PthreadTakePendingSignal(thread, signum)) {
-		return;
-	}
-
-	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-	if (handler != nullptr) {
-		SignalDispatchScope scope;
-		auto                ctx           = CreateSignalUcontext(context);
-		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
-		if (!guest_context) {
-			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx]() mutable {
-				SignalDispatchScope helper_scope;
-				auto*               previous_self = PthreadSwapSelfForSignal(thread);
-				handler(signum, &ctx);
-				PthreadSwapSelfForSignal(previous_self);
-			}).detach();
-			return;
-		}
-		handler(signum, &ctx);
-		if (guest_context) {
-			ApplySignalUcontext(context, ctx);
-		}
-	}
-}
-
-#endif
 
 void KernelDispatchPendingSignalForCurrentThread() {
 	Pthread current = PthreadSelfOrNull();
@@ -1125,50 +928,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const auto target_thread_id       = PthreadGetHostThreadId(thread);
-		auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
-		if (target_thread_id == 0) {
-			return KERNEL_ERROR_EINVAL;
-		}
-		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
-			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			handler(signum, &ctx);
-			return OK;
-		}
-		if (nt_queue_apc_thread_ex == nullptr) {
-			return KERNEL_ERROR_EINVAL;
-		}
-
-		HANDLE target_thread =
-		    OpenThread(THREAD_SET_CONTEXT, FALSE, static_cast<DWORD>(target_thread_id));
-		if (target_thread == nullptr) {
-			return KERNEL_ERROR_EINVAL;
-		}
-
-		PthreadQueuePendingSignal(thread, signum);
-		KytyUserApcOption option {};
-		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
-
-		const auto status =
-		    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
-		                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)), nullptr);
-
-		if (status != 0) {
-			PthreadTakePendingSignal(thread, signum);
-			CloseHandle(target_thread);
-			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
-			     "\n",
-			     target_thread_id, status);
-			return KERNEL_ERROR_EINVAL;
-		}
-
-		PthreadWakeForSignal(thread);
-		CloseHandle(target_thread);
-		return OK;
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
 			SignalDispatchScope scope;
@@ -2361,35 +2121,20 @@ struct FiberThreadContext {
 };
 
 static const auto g_fiber_context_key = [] {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const auto key = TlsAlloc();
-	if (key == TLS_OUT_OF_INDEXES) {
-		std::abort();
-	}
-#else
 	pthread_key_t key;
 	if (pthread_key_create(&key, nullptr) != 0) {
 		std::abort();
 	}
-#endif
 	return key;
 }();
 
 // Native lookup must stay fresh when a fiber resumes on another host thread.
 static FiberThreadContext* FiberGetThreadContext() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	return static_cast<FiberThreadContext*>(TlsGetValue(g_fiber_context_key));
-#else
 	return static_cast<FiberThreadContext*>(pthread_getspecific(g_fiber_context_key));
-#endif
 }
 
 static void FiberSetThreadContext(FiberThreadContext* context) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (TlsSetValue(g_fiber_context_key, context) == 0) {
-#else
 	if (pthread_setspecific(g_fiber_context_key, context) != 0) {
-#endif
 		std::abort();
 	}
 }

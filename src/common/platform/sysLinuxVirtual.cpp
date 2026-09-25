@@ -1,8 +1,5 @@
 #include "common/common.h"
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_LINUX
-// #error "KYTY_PLATFORM != KYTY_PLATFORM_LINUX"
-#else
 
 #include "common/assert.h"
 #include "common/virtualMemory.h"
@@ -18,7 +15,7 @@
 // IWYU pragma: no_include <bits/pthread_types.h>
 // IWYU pragma: no_include <linux/mman.h>
 
-#if defined(MAP_FIXED_NOREPLACE) && KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(MAP_FIXED_NOREPLACE)
 #define KYTY_FIXED_NOREPLACE
 #endif
 
@@ -477,4 +474,3 @@ bool FlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 
 } // namespace Common::VirtualMemory
 
-#endif

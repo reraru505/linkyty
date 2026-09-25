@@ -32,20 +32,8 @@
 #include <memory>
 #include <vector>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
-#endif
-#endif
 
 namespace Libs::LibKernel {
 void SetProgName(const std::string& name);
@@ -369,68 +357,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
-#if defined(__APPLE__)
-		// Clang on macOS can allocate plain "r" inputs to r12/r13, which the template
-		// clobbers before consuming them. Pin the inputs to registers the SysV guest
-		// preserves without changing register allocation on Windows or Linux.
-		register entry_func_t func_reg asm("rbx")      = func;
-		register uintptr_t    guest_rsp_reg asm("r14") = guest_rsp;
-		register uintptr_t    guest_rbp_reg asm("r15") = guest_rbp;
-#endif
 
-#if defined(__APPLE__)
-		asm volatile(
-		    "pushq %%r12\n\t"
-		    "pushq %%r13\n\t"
-		    "movq %%rsp, %%r12\n\t"
-		    "movq %%rbp, %%r13\n\t"
-		    "movq %[guest_rsp], %%rsp\n\t"
-		    "movq %[guest_rbp], %%rbp\n\t"
-		    "callq *%[func]\n\t"
-		    "movq %%r13, %%rbp\n\t"
-		    "movq %%r12, %%rsp\n\t"
-		    "popq %%r13\n\t"
-		    "popq %%r12\n\t"
-		    :
-		    : [func] "r"(func_reg), "D"(params),
-		      "S"(atexit_func), [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
-		    : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
-		      "xmm13", "xmm14", "xmm15");
-#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Windows stack probes use the TEB stack limits during the guest stack switch.
-		// bounds, which describe the host stack and are invalid while RSP is in guest memory.
-		register entry_func_t func_reg asm("rbx")     = func;
-		register uintptr_t    guest_rsp_reg asm("r8") = guest_rsp;
-		register uintptr_t    guest_rbp_reg asm("r9") = guest_rbp;
-		asm volatile("pushq %%r12\n\t"
-		             "pushq %%r13\n\t"
-		             "pushq %%r14\n\t"
-		             "pushq %%r15\n\t"
-		             "movq %%gs:0x08, %%r14\n\t"
-		             "movq %%gs:0x10, %%r15\n\t"
-		             "xorq %%rcx, %%rcx\n\t"
-		             "movq %%rcx, %%gs:0x08\n\t"
-		             "movq %%rcx, %%gs:0x10\n\t"
-		             "movq %%rsp, %%r12\n\t"
-		             "movq %%rbp, %%r13\n\t"
-		             "movq %[guest_rsp], %%rsp\n\t"
-		             "movq %[guest_rbp], %%rbp\n\t"
-		             "callq *%[func]\n\t"
-		             "movq %%r13, %%rbp\n\t"
-		             "movq %%r12, %%rsp\n\t"
-		             "movq %%r14, %%gs:0x08\n\t"
-		             "movq %%r15, %%gs:0x10\n\t"
-		             "popq %%r15\n\t"
-		             "popq %%r14\n\t"
-		             "popq %%r13\n\t"
-		             "popq %%r12\n\t"
-		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
-		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
-		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-		               "xmm12", "xmm13", "xmm14", "xmm15");
-#else
 		// Clobbers prevent inputs from being allocated to r12/r13.
 		asm volatile("movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
@@ -445,38 +372,12 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
 		               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
 		               "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
-#endif
 		return;
 	}
 
 	uintptr_t guest_root_frame[2] = {};
 
-#if defined(__APPLE__)
-	register entry_func_t func_reg asm("rbx")      = func;
-	register uintptr_t    guest_rbp_reg asm("r14") = reinterpret_cast<uintptr_t>(guest_root_frame);
-#endif
 
-#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	asm volatile("pushq %%r12\n\t"
-	             "pushq %%r13\n\t"
-	             "movq %%rbp, %%r12\n\t"
-	             "movq %[guest_rbp], %%rbp\n\t"
-	             "callq *%[func]\n\t"
-	             "movq %%r12, %%rbp\n\t"
-	             "popq %%r13\n\t"
-	             "popq %%r12\n\t"
-	             :
-#if defined(__APPLE__)
-	             : [func] "r"(func_reg), "D"(params),
-	               "S"(atexit_func), [guest_rbp] "r"(guest_rbp_reg)
-#else
-	             : [func] "r"(func), "D"(params),
-	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
-#endif
-	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
-	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
-#else
 	// Keep inputs out of r12.
 	asm volatile("movq %%rbp, %%r12\n\t"
 	             "movq %[guest_rbp], %%rbp\n\t"
@@ -488,7 +389,6 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "xmm0",
 	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
 	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
-#endif
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
@@ -499,10 +399,6 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 struct MainEntryStackTestState {
 	bool      called = false;
 	uintptr_t rsp    = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t teb_stack_base  = UINTPTR_MAX;
-	uintptr_t teb_stack_limit = UINTPTR_MAX;
-#endif
 };
 
 static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
@@ -516,13 +412,6 @@ static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
 	             :
 	             : "memory");
 	asm volatile("movq %%rsp, %0" : "=r"(state->rsp) : : "memory");
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	asm volatile("movq %%gs:0x08, %0\n\t"
-	             "movq %%gs:0x10, %1\n\t"
-	             : "=r"(state->teb_stack_base), "=r"(state->teb_stack_limit)
-	             :
-	             : "memory");
-#endif
 	state->called = true;
 }
 
@@ -540,33 +429,11 @@ bool TestMainEntryUsesGuestStack() {
 	std::memset(reinterpret_cast<void*>(stack_base), 0xcd, stack_size);
 	auto* root_frame = reinterpret_cast<const uintptr_t*>(stack_base + stack_size) - 2;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t original_teb_stack_base  = 0;
-	uintptr_t original_teb_stack_limit = 0;
-	asm volatile("movq %%gs:0x08, %0\n\t"
-	             "movq %%gs:0x10, %1\n\t"
-	             : "=r"(original_teb_stack_base), "=r"(original_teb_stack_limit)
-	             :
-	             : "memory");
-#endif
 
 	RunEntry(reinterpret_cast<uint64_t>(TestMainEntryStackCallback), &params, nullptr,
 	         reinterpret_cast<void*>(stack_base + stack_size));
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t restored_teb_stack_base  = 0;
-	uintptr_t restored_teb_stack_limit = 0;
-	asm volatile("movq %%gs:0x08, %0\n\t"
-	             "movq %%gs:0x10, %1\n\t"
-	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
-	             :
-	             : "memory");
-	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
-	                    restored_teb_stack_base == original_teb_stack_base &&
-	                    restored_teb_stack_limit == original_teb_stack_limit;
-#else
 	constexpr bool teb_ok = true;
-#endif
 
 	const bool rsp_ok  = state.rsp >= stack_base && state.rsp < stack_base + stack_size;
 	const bool root_ok = root_frame[0] == 0 && root_frame[1] == 0;
@@ -594,14 +461,7 @@ bool TestModuleRelocationUsesWritableHostMapping() {
 	const bool after_ok = Libs::LibKernel::Memory::KernelVirtualQuery(
 	                          reinterpret_cast<const void*>(base), 0, &after, sizeof(after)) == 0;
 	const bool value_ok = *reinterpret_cast<const uint64_t*>(base) == value;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	MEMORY_BASIC_INFORMATION mbi {};
-	const bool               host_mode_ok =
-	    VirtualQuery(reinterpret_cast<const void*>(base), &mbi, sizeof(mbi)) != 0 &&
-	    mbi.Protect == PAGE_READWRITE;
-#else
 	constexpr bool host_mode_ok = true;
-#endif
 	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(base, page_size);
 
 	return before_ok && after_ok && changed && value_ok && host_mode_ok && freed &&
@@ -717,40 +577,6 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		return false;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uint64_t current = addr;
-	while (current < end) {
-		MEMORY_BASIC_INFORMATION mbi {};
-		if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
-		    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-			return false;
-		}
-		const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-		if (region_end <= current) {
-			return false;
-		}
-		current = std::min(region_end, end);
-	}
-#elif defined(__APPLE__)
-	// Walk the Mach regions covering the range and require read permission. The fatal
-	// report dumps memory behind raw register values, and a fault inside the reporter
-	// re-enters the signal handler and wedges the reporting thread.
-	uint64_t current = addr;
-	while (current < end) {
-		mach_vm_address_t              region_addr = current;
-		mach_vm_size_t                 region_size = 0;
-		vm_region_basic_info_data_64_t info {};
-		mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
-		mach_port_t                    object_name = MACH_PORT_NULL;
-		if (mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
-		                   reinterpret_cast<vm_region_info_t>(&info), &count,
-		                   &object_name) != KERN_SUCCESS ||
-		    region_addr > current || (info.protection & VM_PROT_READ) == 0) {
-			return false;
-		}
-		current = region_addr + region_size;
-	}
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
 	if (page_size == 0) {
 		return false;
@@ -773,9 +599,6 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		}
 		current = next;
 	}
-#else
-	(void)end;
-#endif
 	return true;
 }
 
@@ -1434,17 +1257,6 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	Libs::LibKernel::PthreadInitSelfForMainThread();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// Guest code has no Windows stack probes and may jump over the guard page. Module
-	// initializers execute on the host stack too, so grow it before calling any guest code.
-	size_t expanded_size = 0;
-	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		sys_dbg_stack_info_t stack {};
-		SysStackUsage(stack);
-		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
-		expanded_size += stack.guard_size;
-	}
-#endif
 
 	PreloadAdjacentPrograms();
 	RelocateAll();
@@ -2015,36 +1827,14 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
 	const bool emulate_rsqrt = Config::AmdCpuEnabled();
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
-	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
-	if (use_red_zone_protection) {
-		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += RED_ZONE_TRAMPOLINE_SIZE;
-	}
-#endif
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (use_red_zone_protection) {
-		program->red_zone_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
-		program->red_zone_trampoline_size  = RED_ZONE_TRAMPOLINE_SIZE;
-		RegisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr),
-		                           program->base_size_aligned,
-		                           reinterpret_cast<void*>(program->red_zone_trampoline_vaddr),
-		                           program->red_zone_trampoline_size);
-	}
-#endif
 	if (!is_shared) {
 		program->tls.handler_vaddr = program->base_vaddr + program->base_size_aligned;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		program->tls.handler_vaddr += program->red_zone_trampoline_size;
-#endif
 	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
@@ -2064,10 +1854,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uint64_t                                   eh_frame_header_addr = 0;
-	uint64_t                                   eh_frame_header_size = 0;
-#endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
@@ -2126,49 +1912,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection && phdr[i].p_type == PT_GNU_EH_FRAME) {
-			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
-			eh_frame_header_size = phdr[i].p_memsz;
-		}
-#endif
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::vector<uintptr_t> function_starts;
-	if (use_red_zone_protection) {
-		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
-		                                 &function_starts)) {
-			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
-			     Common::PathToString(program->file_name).c_str());
-		}
-	}
-#endif
 	for (const auto& [segment_addr, segment_size]: executable_segments) {
 		uint64_t reciprocal_sqrt_count = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection) {
-			const auto result =
-			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt);
-			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
-			     result.red_zone_function_count, result.memory_instruction_count,
-			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
-			     result.stack_dependent_memory_instruction_count,
-			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count);
-			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
-		}
-#else
 		if (emulate_rsqrt) {
 			reciprocal_sqrt_count =
 			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
-#endif
 		if (reciprocal_sqrt_count != 0) {
 			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
@@ -2200,11 +1952,6 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (program->red_zone_trampoline_size != 0) {
-			UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
-		}
-#endif
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
 	}

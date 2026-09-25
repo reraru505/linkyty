@@ -78,9 +78,6 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
-#endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
@@ -191,12 +188,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (arg == "--redzone") {
-			options.config.red_zone_protection_enabled = true;
-			continue;
-		}
-#endif
 
 		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
@@ -382,33 +373,8 @@ static int Main(int argc, char* argv[]) {
 	return 0;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-
-int wmain(int argc, wchar_t* argv[]) {
-    std::vector<std::string> utf8_args;
-    utf8_args.reserve(static_cast<size_t>(argc));
-
-    for (int index = 0; index < argc; index++) {
-        const std::wstring_view wide(argv[index]);
-        const std::u16string utf16(wide.begin(), wide.end());
-
-        utf8_args.push_back(Common::Utf16ToUtf8(utf16));
-    }
-
-    std::vector<char*> utf8_argv;
-    utf8_argv.reserve(utf8_args.size());
-
-    for (auto& argument: utf8_args) {
-        utf8_argv.push_back(argument.data());
-    }
-
-    return Main(argc, utf8_argv.data());
-}
-
-#else
 
 int main(int argc, char* argv[]) {
     return Main(argc, argv);
 }
 
-#endif

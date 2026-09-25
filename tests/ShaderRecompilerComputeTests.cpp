@@ -89,20 +89,10 @@
 #include <string_view>
 #include <vector>
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#undef min
-#undef max
-#endif
 
 namespace Libs::Graphics {
 
@@ -1111,7 +1101,6 @@ void CheckErrorDialogLifecycle() {
   std::printf("[host]    %-32s ok\n", "ErrorDialogLifecycle");
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 template <typename Function>
 void ExpectFatal(const char *name, Function function) {
   const pid_t pid = ::fork();
@@ -1134,7 +1123,6 @@ void ExpectFatal(const char *name, Function function) {
           "fatal shader path did not terminate with status 321");
   std::printf("[host]    %-32s ok\n", name);
 }
-#endif
 
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
@@ -10329,14 +10317,12 @@ public:
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
       mipped_storage_resource.mip_count = 3;
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
       ExpectFatal("MipViewPhysicalLayoutChange", [&] {
         auto linear_view = overwide_mipped_storage_descriptor;
         linear_view.dwords[3] &= ~(0x1fu << 20u);
         (void)RenderExecutorTestAccess::ResolveTexture(executor, mipped_storage_resource,
                                                        linear_view);
       });
-#endif
       auto sampled_overwide_resource = storage_resource;
       sampled_overwide_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -10492,14 +10478,12 @@ public:
         AppendStoreVgpr(&lod_test.code, 0, 0);
         AppendEnd(&lod_test.code);
         const auto lod_program = CompileCase(lod_test, SubgroupSize());
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
         ExpectFatal("TextureMinLodBeyondView", [&] {
           auto invalid_lod = lod_descriptor;
           invalid_lod.dwords[1] |= 1024u << 8u;
           (void)RenderExecutorTestAccess::ResolveTexture(
               executor, lod_program.program.info.images[0], invalid_lod);
         });
-#endif
         const auto lod_binding = RenderExecutorTestAccess::ResolveTexture(
             executor, lod_program.program.info.images[0], lod_descriptor);
         for (uint32_t mip = 0; mip < 4; ++mip) {
@@ -24811,7 +24795,6 @@ TestCase ScratchIsPrivatePerInvocation() {
   return test;
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 TestCase FlatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -24859,7 +24842,6 @@ TestCase FlatStoreVariants() {
                  O::FLAT_STORE_DWORDX3, O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
   return test;
 }
-#endif
 
 TestCase DsReadWriteVariants() {
   using O = ShaderOpcode;
@@ -29209,104 +29191,6 @@ void CheckEmbeddedFetchVertexOffset() {
   std::_Exit(0x7f);
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-void CheckRenderTargetFormatContract() {
-  const auto r8_uint = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
-      Prospero::ChannelOrder::kStandard);
-  Require("RenderTargetFormat", "R8 uint",
-          r8_uint.format == vk::Format::eR8Uint &&
-              r8_uint.bytes_per_element == 1u &&
-              r8_uint.export_mapping.IsIdentity(),
-          "R8 uint render-target tuple was rejected");
-
-  const auto rgb565 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
-      Prospero::ChannelOrder::kStandard);
-  Require("RenderTargetFormat", "RGB565 UNorm",
-          rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
-              rgb565.bytes_per_element == 2u &&
-              rgb565.export_mapping.IsIdentity(),
-          "RGB565 UNorm render-target tuple was rejected");
-
-  const auto uint_format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUInt,
-      Prospero::ChannelOrder::kStandard);
-  Require("RenderTargetFormat", "RGBA16 uint",
-          uint_format.format == vk::Format::eR16G16B16A16Uint &&
-              uint_format.bytes_per_element == 8u &&
-              uint_format.export_mapping.IsIdentity(),
-          "RGBA16 uint render-target tuple was rejected");
-
-  const auto format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-      Prospero::ChannelOrder::kReversed);
-  Require("ReverseRenderTarget", "exact format",
-          format.format == vk::Format::eR16G16B16A16Sfloat &&
-              format.bytes_per_element == 8u &&
-              format.export_mapping == Prospero::ColorMappingAbgr,
-          "exact reverse RGBA16F render-target tuple was rejected");
-  Require("ReverseRenderTarget", "write masks",
-          format.export_mapping.ApplyMask(0x1u) == 0x8u &&
-              format.export_mapping.ApplyMask(0x2u) == 0x4u &&
-              format.export_mapping.ApplyMask(0x4u) == 0x2u &&
-              format.export_mapping.ApplyMask(0x8u) == 0x1u &&
-              format.export_mapping.ApplyMask(0xfu) == 0xfu,
-          "reverse RGBA16F component mask was not mapped exactly once");
-
-  const auto rg32 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
-      Prospero::ChannelOrder::kReversed);
-  Require(
-      "ReverseRenderTarget", "GR32 float",
-      rg32.format == vk::Format::eR32G32Sfloat &&
-          rg32.bytes_per_element == 8u &&
-          rg32.export_mapping == Prospero::ColorMappingGr &&
-          rg32.export_mapping.ApplyMask(0x1u) == 0x2u &&
-          rg32.export_mapping.ApplyMask(0x2u) == 0x1u &&
-          rg32.export_mapping.ApplyMask(0x3u) == 0x3u &&
-          rg32.export_mapping.ApplyMask(0xfu) == 0xfu,
-      "reverse GR32F render-target export or write-mask mapping is incorrect");
-
-  const auto argb = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-      Prospero::ChannelOrder::kAltReversed);
-  Require(
-      "ReverseRenderTarget", "ARGB float",
-      argb.format == vk::Format::eR16G16B16A16Sfloat &&
-          argb.export_mapping == Prospero::ColorMappingArgb &&
-          argb.export_mapping.ApplyMask(0x1u) == 0x2u &&
-          argb.export_mapping.ApplyMask(0x2u) == 0x4u &&
-          argb.export_mapping.ApplyMask(0x4u) == 0x8u &&
-          argb.export_mapping.ApplyMask(0x8u) == 0x1u,
-      "alternate-reversed render-target mapping did not invert its ARGB cycle");
-
-  char path[MAX_PATH]{};
-  Require("ReverseRenderTarget", "host",
-          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
-          "GetModuleFileName failed");
-  std::string command = std::string("\"") + path + "\" --reverse-rt-death";
-  std::vector<char> mutable_command(command.begin(), command.end());
-  mutable_command.push_back('\0');
-  STARTUPINFOA startup{sizeof(startup)};
-  PROCESS_INFORMATION process{};
-  Require("ReverseRenderTarget", "host",
-          CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
-                         FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                         &process) != 0,
-          "CreateProcess failed");
-  Require("ReverseRenderTarget", "host",
-          WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
-          "unsupported adjacent render-target tuple timed out");
-  DWORD exit_code = 0;
-  const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  Require("ReverseRenderTarget", "hard failure", exited && exit_code == 321,
-          "invalid render-target tuple did not retain the fatal guard");
-  std::printf("[host]    %-32s ok\n", "RenderTargetFormat");
-}
-#endif
 
 [[noreturn]] void RunImageViewDeathCase(const char *kind) {
   if (std::strcmp(kind, "sampled-invalid-selector") == 0) {
@@ -29381,228 +29265,6 @@ void CheckRenderTargetFormatContract() {
   std::_Exit(0x7f);
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-void CheckSampledColorViews() {
-  Require("SampledColorViews", "identity",
-          SelectSampledColorView(vk::Format::eR8G8B8A8Unorm,
-                                 vk::Format::eR8G8B8A8Unorm,
-                                 DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7),
-          "RGBA did not select the identity view");
-  uint32_t valid_swizzles = 0;
-  for (uint32_t swizzle = 0; swizzle <= 0xfffu; swizzle++) {
-    bool expected = true;
-    for (uint32_t channel = 0; channel < 4; channel++) {
-      const auto selector = GetDstSel(swizzle, channel);
-      if (selector == 2 || selector == 3) {
-        expected = false;
-      }
-    }
-    const bool valid = IsValidImageSwizzle(swizzle);
-    const bool supported = IsSupportedSampledColorView(
-        vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, swizzle);
-    Require("SampledColorViews", "exhaustive read swizzle domain",
-            valid == expected && supported == expected,
-            "sampled swizzle validator disagreed with the PS5 selector domain");
-    valid_swizzles += valid;
-  }
-  Require("SampledColorViews", "all PS5 read swizzles",
-          valid_swizzles == 1296 && !IsValidImageSwizzle(DstSel(4, 5, 6, 2)) &&
-              !IsValidImageSwizzle(DstSel(4, 5, 6, 3)) &&
-              !IsValidImageSwizzle(0x1000),
-          "valid PS5 sampled mappings were rejected or reserved selectors were "
-          "admitted");
-  const auto arbitrary = DstSel(5, 1, 7, 0);
-  const auto components = TextureGetComponentMapping(arbitrary, {});
-  Require("SampledColorViews", "generic Vulkan component mapping",
-          SelectSampledColorView(vk::Format::eR8G8B8A8Unorm,
-                                 vk::Format::eR8G8B8A8Unorm,
-                                 arbitrary) == arbitrary &&
-              components.r == vk::ComponentSwizzle::eG &&
-              components.g == vk::ComponentSwizzle::eOne &&
-              components.b == vk::ComponentSwizzle::eA &&
-              components.a == vk::ComponentSwizzle::eZero,
-          "arbitrary valid sampled mapping did not use the generic view path");
-  Require("SampledColorViews", "R8 R001",
-          SelectSampledColorView(vk::Format::eR8Unorm, vk::Format::eR8Unorm,
-                                 DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
-          "R8 did not select its R001 view");
-  Require("SampledColorViews", "R8 000R",
-          SelectSampledColorView(vk::Format::eR8Unorm, vk::Format::eR8Unorm,
-                                 DstSel(0, 0, 0, 4)) == DstSel(0, 0, 0, 4),
-          "R8 did not select its 000R component-mapped view");
-  Require("SampledColorViews", "mutable R8 uint/unorm 000R",
-          SelectSampledColorView(vk::Format::eR8Uint, vk::Format::eR8Unorm,
-                                 DstSel(0, 0, 0, 4)) == DstSel(0, 0, 0, 4),
-          "compatible R8 integer target sampled view was rejected");
-  Require("SampledColorViews", "R16G16 RG01",
-          SelectSampledColorView(vk::Format::eR16G16Sfloat,
-                                 vk::Format::eR16G16Sfloat,
-                                 DstSel(4, 5, 0, 1)) == DstSel(4, 5, 0, 1),
-          "R16G16 did not select its RG01 view");
-  Require("SampledColorViews", "alpha one",
-          SelectSampledColorView(vk::Format::eR8G8B8A8Unorm,
-                                 vk::Format::eR8G8B8A8Unorm,
-                                 DstSel(4, 5, 6, 1)) == DstSel(4, 5, 6, 1),
-          "RGB1 did not select the alpha-one view");
-  Require("SampledColorViews", "mutable BGRA target",
-          SelectSampledColorView(vk::Format::eB8G8R8A8Unorm,
-                                 vk::Format::eR8G8B8A8Unorm,
-                                 DstSel(6, 5, 4, 7)) == DstSel(6, 5, 4, 7),
-          "BGRA target did not select the exact RGBA/BGRA mutable view");
-  Require(
-      "SampledColorViews", "mutable sRGB view of UNORM BGRA target",
-      SelectSampledColorView(vk::Format::eB8G8R8A8Unorm,
-                             vk::Format::eR8G8B8A8Srgb,
-                             DstSel(6, 5, 4, 7)) == DstSel(6, 5, 4, 7),
-      "UNORM BGRA target did not select its compatible sRGB RGBA sampled view");
-  Require("SampledColorViews", "mutable sRGB BGRA target",
-          SelectSampledColorView(vk::Format::eB8G8R8A8Srgb,
-                                 vk::Format::eR8G8B8A8Srgb,
-                                 DstSel(6, 5, 4, 7)) == DstSel(6, 5, 4, 7),
-          "sRGB BGRA target did not select its matching mutable RGBA view");
-  constexpr auto colorspace_swizzle = DstSel(5, 1, 7, 0);
-  Require("SampledColorViews", "mutable sRGB/UNORM views",
-          SelectSampledColorView(vk::Format::eR8G8B8A8Srgb,
-                                 vk::Format::eR8G8B8A8Unorm,
-                                 DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7) &&
-              SelectSampledColorView(vk::Format::eB8G8R8A8Unorm,
-                                     vk::Format::eB8G8R8A8Srgb,
-                                     colorspace_swizzle) == colorspace_swizzle,
-          "same-order mutable sRGB/UNORM sampled views were rejected");
-  Require("SampledColorViews", "mutable packed RGB10 view",
-          SelectSampledColorView(vk::Format::eA2R10G10B10UnormPack32,
-                                 vk::Format::eA2B10G10R10UnormPack32,
-                                 DstSel(6, 5, 4, 7)) == DstSel(6, 5, 4, 7),
-          "packed RGB10 target did not select its matching mutable "
-          "channel-order view");
-  Require(
-      "SampledColorViews", "reverse RGBA16F sampled view",
-      SelectSampledColorView(vk::Format::eR16G16B16A16Sfloat,
-                             vk::Format::eR16G16B16A16Sfloat,
-                             DstSel(7, 6, 5, 4)) == DstSel(7, 6, 5, 4),
-      "reverse RGBA16F target did not select its reciprocal ABGR sampled view");
-  Require("SampledColorViews", "mutable integer-class views",
-          SelectSampledColorView(vk::Format::eR16G16B16A16Sfloat,
-                                 vk::Format::eR16G16B16A16Uint,
-                                 DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7) &&
-              SelectSampledColorView(
-                  vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Uint,
-                  DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7) &&
-              SelectSampledColorView(vk::Format::eR8G8B8A8Uint,
-                                     vk::Format::eR8G8B8A8Unorm,
-                                     DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7),
-          "compatible integer render-target sampled view was rejected");
-  Require("SampledColorViews", "invalid depth format",
-          !IsSupportedSampledDepthView(vk::Format::eD24UnormS8Uint,
-                                       vk::Format::eR8Unorm,
-                                       DstSel(4, 4, 4, 4)),
-          "incompatible sampled depth format was accepted");
-  Require("SampledColorViews", "invalid depth swizzle",
-          !IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                       vk::Format::eR32Sfloat,
-                                       DstSel(4, 5, 6, 7)),
-          "incompatible sampled depth swizzle was accepted");
-  Require("SampledColorViews", "D32 depth target",
-          IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                      vk::Format::eR32Sfloat,
-                                      DstSel(4, 4, 4, 4)),
-          "D32 depth target did not select its depth-aspect view");
-  Require("SampledColorViews", "D16 R000 depth target",
-          IsSupportedSampledDepthView(
-              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 0, 0, 0)),
-          "D16 depth target did not select its R000 depth-aspect view");
-  Require("SampledColorViews", "D16S8 R001 depth target",
-          IsSupportedSampledDepthView(vk::Format::eD16UnormS8Uint,
-                                      vk::Format::eR16Unorm,
-                                      DstSel(4, 0, 0, 1)),
-          "D16S8 depth target did not select its R001 depth-aspect view");
-  Require("SampledColorViews", "promoted D24S8 R001 depth target",
-          IsSupportedSampledDepthView(vk::Format::eD24UnormS8Uint,
-                                      vk::Format::eR16Unorm,
-                                      DstSel(4, 0, 0, 1)),
-          "D24S8 host fallback did not preserve the guest R16 depth view");
-  Require("SampledColorViews", "promoted D32S8 R001 depth target",
-          IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                      vk::Format::eR16Unorm,
-                                      DstSel(4, 0, 0, 1)),
-          "D32S8 host fallback did not preserve the guest R16 depth view");
-  Require("SampledColorViews", "D32S8 R001 depth target",
-          IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                      vk::Format::eR32Sfloat,
-                                      DstSel(4, 0, 0, 1)),
-          "D32S8 depth target did not select its R001 depth-aspect view");
-  ShaderRecompiler::IR::ImageResource storage_resource{};
-  storage_resource.resource_class =
-      ShaderRecompiler::IR::ImageResourceClass::Storage;
-  storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
-  storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  storage_resource.written = true;
-  Require("SampledColorViews", "storage resource",
-          IsSupportedStorageImageResource(storage_resource),
-          "exact storage resource contract was rejected");
-  storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
-  storage_resource.read = true;
-  Require("SampledColorViews", "read-write 3D storage resource",
-          IsSupportedStorageImageResource(storage_resource),
-          "basic read-write 3D storage resource was rejected");
-  storage_resource.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  storage_resource.read = false;
-  Require("SampledColorViews", "write-only 2D-array storage resource",
-          IsSupportedStorageImageResource(storage_resource),
-          "basic write-only 2D-array storage resource was rejected");
-  storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
-  Require("SampledColorViews", "write-only uint 2D-array storage resource",
-          IsSupportedStorageImageResource(storage_resource),
-          "basic write-only uint 2D-array storage resource was rejected");
-  storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  storage_resource.read = true;
-  storage_resource.atomic = true;
-  Require("SampledColorViews", "atomic uint 2D storage resource",
-          IsSupportedStorageImageResource(storage_resource),
-          "atomic uint storage resource was rejected");
-  storage_resource.atomic = false;
-  storage_resource.mip_mode =
-      ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-  storage_resource.mip_count = 3;
-  Require("SampledColorViews", "dynamic storage mip resource",
-          IsSupportedStorageImageResource(storage_resource),
-          "dynamic storage mip resource was rejected");
-
-  char path[MAX_PATH]{};
-  Require("SampledColorViews", "host",
-          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
-          "GetModuleFileName failed");
-  for (const char *kind :
-       {"sampled-invalid-selector", "sampled-incompatible-format",
-        "sampled-invalid-high", "storage-incompatible-format", "storage-kind",
-        "storage-no-write", "storage-nonuint-atomic", "storage-compare",
-        "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
-    std::string command =
-        std::string("\"") + path + "\" --image-view-death " + kind;
-    std::vector<char> mutable_command(command.begin(), command.end());
-    mutable_command.push_back('\0');
-    STARTUPINFOA startup{sizeof(startup)};
-    PROCESS_INFORMATION process{};
-    Require("SampledColorViews", "host",
-            CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
-                           FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                           &process) != 0,
-            "CreateProcess failed");
-    Require("SampledColorViews", "host",
-            WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
-            "unsupported view death case timed out");
-    DWORD exit_code = 0;
-    const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    Require("SampledColorViews", "host", exited && exit_code == 321,
-            std::string(kind) +
-                " component mapping did not report a fatal error");
-  }
-  std::printf("[host]    %-32s ok\n", "SampledColorRenderTargetViews");
-}
-#endif
 
 void CheckSampledDepthResource() {
   ShaderRecompiler::IR::ImageResource resource{};
@@ -30300,468 +29962,6 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
   std::_Exit(0x7f);
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-void CheckBasicStorageTextureDescriptor() {
-  const auto descriptor = BasicStorageTextureDescriptor();
-  Require("BasicStorageTexture", "descriptor",
-          descriptor.Base40() == 0x785d0000ull &&
-              descriptor.Width5() + 1u == 33 &&
-              descriptor.Height5() + 1u == 33 && descriptor.Depth() + 1u == 33,
-          "basic 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicStorageTextureResource(), descriptor, 0x10000);
-
-  const ShaderTextureResource extended{{0x204aca00u, 0xc4700000u, 0x000fc00fu,
-                                        0xa1b00facu, 0x0000003fu, 0x00700000u,
-                                        0x006b0000u, 0x00204b0au}};
-  auto extended_resource = BasicStorageTextureResource();
-  extended_resource.read = false;
-  Require("BasicStorageTexture", "extended descriptor",
-          extended.fields[6] != 0 && extended.fields[7] != 0,
-          "extended 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(extended_resource, extended, 0x400000);
-
-  const auto linear = BasicLinearStorageTextureDescriptor();
-  Require("BasicStorageTexture", "linear descriptor",
-          linear.Base40() == 0x4bcc40100ull && linear.Width5() + 1u == 3840 &&
-              linear.Height5() + 1u == 2160 && linear.Depth() + 1u == 1 &&
-              linear.Format() == Prospero::BufferFormat::k8_8_8_8UNorm &&
-              linear.TileMode() == Prospero::TileMode::kLinear,
-          "PPSA07429 linear 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicLinearStorageTextureResource(), linear,
-                         0x1fa4000);
-
-  const auto bgra = BasicBgraStorageTextureDescriptor();
-  Require("BasicStorageTexture", "BGRA descriptor",
-          bgra.Base40() == 0x7c650000ull && bgra.Width5() + 1u == 1920 &&
-              bgra.Height5() + 1u == 1080 && bgra.Depth() + 1u == 1 &&
-              bgra.Format() == Prospero::BufferFormat::k8_8_8_8UNorm &&
-              bgra.TileMode() == Prospero::TileMode::kRenderTarget &&
-              bgra.DstSelXYZW() == DstSel(6, 5, 4, 7),
-          "PPSA02604 BGRA 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), bgra, 0x870000);
-
-  const ShaderTextureResource r128{
-      {0x0202e500u, 0xc8200000u, 0x010dc1dfu, 0x91b00facu, 0, 0, 0, 0}};
-  auto r128_resource = BasicBgraStorageTextureResource();
-  r128_resource.r128 = true;
-  Require("BasicStorageTexture", "PPSA01736 R128 descriptor",
-          r128.Base40() == 0x202e50000ull && r128.Width5() + 1u == 1920 &&
-              r128.Height5() + 1u == 1080 && r128.Depth() + 1u == 1 &&
-              r128.Format() == Prospero::BufferFormat::k8_8_8_8Srgb &&
-              r128.TileMode() == Prospero::TileMode::kRenderTarget &&
-              r128.DstSelXYZW() == DstSel(4, 5, 6, 7),
-          "PPSA01736 R128 storage descriptor fixture is malformed");
-  ValidateStorageTexture(r128_resource, r128, 0x870000);
-
-  const auto r11g11b10 = Ppsa06228R11G11B10StorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA06228 R11G11B10 descriptor",
-          r11g11b10.Base40() == 0x10c6b50000ull &&
-              r11g11b10.Width5() + 1u == 1920 &&
-              r11g11b10.Height5() + 1u == 1080 && r11g11b10.Depth() + 1u == 1 &&
-              r11g11b10.Format() == Prospero::BufferFormat::k11_11_10Float &&
-              r11g11b10.TileMode() == Prospero::TileMode::kRenderTarget &&
-              r11g11b10.DstSelXYZW() == DstSel(4, 5, 6, 1),
-          "PPSA06228 R11G11B10 storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r11g11b10,
-                         0x870000);
-  ValidateStorageColorView(vk::Format::eB8G8R8A8Unorm,
-                           vk::Format::eB10G11R11UfloatPack32,
-                           r11g11b10.DstSelXYZW());
-
-  const auto max_mip = Ppsa01530MaxMipStorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA01530 max-mip descriptor",
-          max_mip.Base40() == 0x4a4290000ull && max_mip.Width5() + 1u == 64 &&
-              max_mip.Height5() + 1u == 64 && max_mip.Depth() + 1u == 1 &&
-              max_mip.BaseLevel() == 0 && max_mip.LastLevel() == 0 &&
-              max_mip.MaxMip() == 5 &&
-              max_mip.Format() == Prospero::BufferFormat::k32_32UInt &&
-              max_mip.TileMode() == Prospero::TileMode::kRenderTarget &&
-              max_mip.DstSelXYZW() == DstSel(4, 5, 0, 1),
-          "PPSA01530 max-mip storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), max_mip,
-                         0x20000);
-  auto mip_one = max_mip;
-  mip_one.fields[3] |= (1u << 12u) | (1u << 16u);
-  Require("BasicStorageTexture", "PPSA01530 mip-one descriptor",
-          mip_one.BaseLevel() == 1 && mip_one.LastLevel() == 1 &&
-              mip_one.MaxMip() == 5,
-          "PPSA01530 mip-one storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one,
-                         0x20000);
-
-  const auto mip_range = Ppsa01340MipRangeStorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA01340 mip-range descriptor",
-          mip_range.Base40() == 0x294dc0000ull &&
-              mip_range.Width5() + 1u == 1280 &&
-              mip_range.Height5() + 1u == 720 && mip_range.Depth() + 1u == 1 &&
-              mip_range.BaseLevel() == 1 && mip_range.LastLevel() == 3 &&
-              mip_range.MaxMip() == 3 &&
-              mip_range.Format() == Prospero::BufferFormat::k16_16_16_16Float &&
-              mip_range.TileMode() == Prospero::TileMode::kRenderTarget &&
-              mip_range.DstSelXYZW() == DstSel(4, 5, 6, 7),
-          "PPSA01340 mip-range storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), mip_range,
-                         0xa30000);
-
-  const auto overwide_mip = Ppsa01340OverwideMipStorageTextureDescriptor();
-  Require(
-      "BasicStorageTexture", "PPSA01340 over-wide mip view",
-      overwide_mip.Base40() == 0x346c00000ull &&
-          overwide_mip.Width5() + 1u == 512 &&
-          overwide_mip.Height5() + 1u == 512 && overwide_mip.BaseLevel() == 0 &&
-          overwide_mip.LastLevel() == 9 && overwide_mip.MaxMip() == 8 &&
-          overwide_mip.Format() == Prospero::BufferFormat::k32_32_32_32UInt &&
-          overwide_mip.TileMode() == Prospero::TileMode::kStandard64KB,
-      "captured over-wide storage mip view is malformed");
-  TileSizeAlign overwide_size{};
-  TileGetTextureTotalSize(overwide_mip.Format(), overwide_mip.Width5() + 1u,
-                          overwide_mip.Height5() + 1u, 1,
-                          overwide_mip.MaxMip() + 1u, overwide_mip.TileMode(),
-                          false, overwide_size);
-  Require("BasicStorageTexture", "PPSA01340 over-wide mip footprint",
-          overwide_size.size == 0x560000 && overwide_size.align == 0x10000,
-          "captured nine-level Standard64KB footprint changed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), overwide_mip,
-                         overwide_size.size);
-
-  const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA02527 R16F descriptor",
-          r16_float.Base40() == 0xce350000ull &&
-              r16_float.Width5() + 1u == 1920 &&
-              r16_float.Height5() + 1u == 1080 && r16_float.Depth() + 1u == 1 &&
-              r16_float.Format() == Prospero::BufferFormat::k16Float &&
-              r16_float.TileMode() == Prospero::TileMode::kRenderTarget &&
-              r16_float.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA02527 R16F 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r16_float,
-                         0x480000);
-
-  const auto r32_float = Ppsa02527R32FloatStorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA02527 R32F descriptor",
-          r32_float.Base40() == 0xcea90000ull &&
-              r32_float.Width5() + 1u == 960 &&
-              r32_float.Height5() + 1u == 540 && r32_float.Depth() + 1u == 1 &&
-              r32_float.Format() == Prospero::BufferFormat::k32Float &&
-              r32_float.TileMode() == Prospero::TileMode::kRenderTarget &&
-              r32_float.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA02527 R32F 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r32_float,
-                         0x280000);
-
-  const auto r8_unorm = Ppsa02527R8UnormStorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA02527 R8 UNORM descriptor",
-          r8_unorm.Base40() == 0xc7d50000ull && r8_unorm.Width5() + 1u == 960 &&
-              r8_unorm.Height5() + 1u == 540 && r8_unorm.Depth() + 1u == 1 &&
-              r8_unorm.Format() == Prospero::BufferFormat::k8UNorm &&
-              r8_unorm.TileMode() == Prospero::TileMode::kRenderTarget &&
-              r8_unorm.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA02527 R8 UNORM 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r8_unorm, 0xc0000);
-
-  const auto yzwx = BasicYzwxStorageTextureDescriptor();
-  Require("BasicStorageTexture", "YZWX descriptor",
-          yzwx.Base40() == 0x62780100ull && yzwx.Width5() + 1u == 8 &&
-              yzwx.Height5() + 1u == 8 && yzwx.Depth() + 1u == 1 &&
-              yzwx.Format() == Prospero::BufferFormat::k32_32_32_32Float &&
-              yzwx.TileMode() == Prospero::TileMode::kLinear &&
-              yzwx.DstSelXYZW() == DstSel(5, 6, 7, 4),
-          "PPSA04181 linear YZWX storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicLinearStorageTextureResource(), yzwx, 0x800);
-  auto all_swizzles = yzwx;
-  all_swizzles.fields[1] =
-      (all_swizzles.fields[1] & ~0x1ff00000u) |
-      (static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 20u);
-  uint32_t valid_storage_swizzles = 0;
-  for (uint32_t swizzle = 0; swizzle <= 0xfffu; swizzle++) {
-    if (!IsValidImageSwizzle(swizzle)) {
-      continue;
-    }
-    all_swizzles.fields[3] = (all_swizzles.fields[3] & ~0xfffu) | swizzle;
-    ValidateStorageTexture(BasicLinearStorageTextureResource(), all_swizzles,
-                           0x800);
-    ValidateStorageColorView(vk::Format::eR16G16B16A16Sfloat,
-                             vk::Format::eR16G16B16A16Sfloat, swizzle);
-    ValidateStorageColorView(vk::Format::eR8G8B8A8Srgb,
-                             vk::Format::eR8G8B8A8Unorm, swizzle);
-    ValidateStorageColorView(vk::Format::eB8G8R8A8Srgb,
-                             vk::Format::eR8G8B8A8Unorm, swizzle);
-    valid_storage_swizzles++;
-  }
-  Require("BasicStorageTexture", "all write swizzles",
-          valid_storage_swizzles == 1296,
-          "valid write-only storage image mappings were rejected");
-
-  const ShaderTextureResource cube{{0x025bca00u, 0xc4700000u, 0x003fc03fu,
-                                    0xb1b00facu, 0x00000005u, 0x00700080u,
-                                    0x00000000u, 0x00000000u}};
-  auto cube_resource = BasicArrayStorageTextureResource();
-  cube_resource.cube = true;
-  Require("BasicStorageTexture", "PPSA07429 cube descriptor",
-          cube.Base40() == 0x25bca0000ull && cube.Width5() + 1u == 256 &&
-              cube.Height5() + 1u == 256 && cube.Depth() + 1u == 6 &&
-              cube.BaseArray5() == 0 && cube.MaxMip() == 8 &&
-              cube.Type() == Prospero::ImageType::kCube &&
-              cube.Format() == Prospero::BufferFormat::k16_16_16_16Float &&
-              cube.TileMode() == Prospero::TileMode::kRenderTarget &&
-              cube.DstSelXYZW() == DstSel(4, 5, 6, 7),
-          "PPSA07429 cube storage descriptor fixture is malformed");
-  ValidateStorageTexture(cube_resource, cube, 0x420000);
-
-  const auto array = BasicArrayStorageTextureDescriptor();
-  Require("BasicStorageTexture", "2D-array descriptor",
-          array.Base40() == 0x2017900000ull && array.Width5() + 1u == 1 &&
-              array.Height5() + 1u == 1 && array.Depth() + 1u == 1 &&
-              array.BaseArray5() == 0 &&
-              array.Type() == Prospero::ImageType::kColor2DArray &&
-              array.Format() == Prospero::BufferFormat::k8_8_8_8UNorm &&
-              array.TileMode() == Prospero::TileMode::kRenderTarget &&
-              array.DstSelXYZW() == DstSel(6, 5, 4, 7),
-          "PPSA21268 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), array, 0x10000);
-  const ShaderTextureResource mip_array{{0x20268d00u, 0xc4700000u, 0x001fc01fu,
-                                         0xd1b11facu, 0x00000000u, 0x00700070u,
-                                         0x00000000u, 0x00000000u}};
-  Require("BasicStorageTexture", "PPSA14457 mip-one 2D-array descriptor",
-          mip_array.BaseLevel() == 1 && mip_array.LastLevel() == 1 &&
-              mip_array.MaxMip() == 7 &&
-              mip_array.Type() == Prospero::ImageType::kColor2DArray &&
-              mip_array.Depth() == 0 && mip_array.BaseArray5() == 0,
-          "PPSA14457 mip-one 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), mip_array,
-                         0x30000);
-
-  const auto uint_array = BasicUintArrayStorageTextureDescriptor();
-  Require("BasicStorageTexture", "uint 2D-array descriptor",
-          uint_array.Base40() == 0x2017920000ull &&
-              uint_array.Width5() + 1u == 1 && uint_array.Height5() + 1u == 1 &&
-              uint_array.Depth() + 1u == 1 && uint_array.BaseArray5() == 0 &&
-              uint_array.Type() == Prospero::ImageType::kColor2DArray &&
-              uint_array.Format() == Prospero::BufferFormat::k32UInt &&
-              uint_array.TileMode() == Prospero::TileMode::kRenderTarget &&
-              uint_array.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA21268 uint 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(), uint_array,
-                         0x10000);
-
-  const ShaderTextureResource standard256b{{
-      0x204e4900u,
-      0x43c00000u,
-      0x00004000u,
-      0x90100facu,
-      0x00000000u,
-      0x00700000u,
-      0x00000000u,
-      0x00000000u,
-  }};
-  auto standard256b_resource = BasicBgraStorageTextureResource();
-  standard256b_resource.numeric_class = Prospero::TextureNumericClass::Uint;
-  TileSizeAlign standard256b_size{};
-  TileGetTextureTotalSize(standard256b.Format(), standard256b.Width5() + 1u,
-                          standard256b.Height5() + 1u,
-                          standard256b.Depth() + 1u, 1, standard256b.TileMode(),
-                          false, standard256b_size);
-  Require("BasicStorageTexture", "Standard256B uint 2D descriptor",
-          standard256b.Width5() + 1u == 2 && standard256b.Height5() + 1u == 2 &&
-              standard256b.Depth() + 1u == 1 &&
-              standard256b.Type() == Prospero::ImageType::kColor2D &&
-              standard256b.Format() == Prospero::BufferFormat::k8_8_8_8UInt &&
-              standard256b.TileMode() == Prospero::TileMode::kStandard256B &&
-              standard256b.DstSelXYZW() == DstSel(4, 5, 6, 7) &&
-              standard256b_size.size == 0x100 &&
-              standard256b_size.align == 0x100,
-          "captured PPSA08511 Standard256B storage descriptor is malformed");
-  ValidateStorageTexture(standard256b_resource, standard256b,
-                         standard256b_size.size);
-
-  const auto standard4kb_array = Standard4KBUintArrayStorageTextureDescriptor();
-  TileSizeAlign standard4kb_size{};
-  TileGetTextureTotalSize(standard4kb_array.Format(), 1, 1, 1, 1,
-                          standard4kb_array.TileMode(), false,
-                          standard4kb_size);
-  Require(
-      "BasicStorageTexture", "Standard4KB uint 2D-array descriptor",
-      standard4kb_array.Type() == Prospero::ImageType::kColor2DArray &&
-          standard4kb_array.Format() == Prospero::BufferFormat::k32UInt &&
-          standard4kb_array.TileMode() == Prospero::TileMode::kStandard4KB &&
-          standard4kb_array.DstSelXYZW() == DstSel(4, 0, 0, 1) &&
-          standard4kb_size.size == 0x1000 && standard4kb_size.align == 0x1000,
-      "captured Standard4KB uint 2D-array descriptor is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(),
-                         standard4kb_array, standard4kb_size.size);
-
-  auto based_standard4kb_array = standard4kb_array;
-  based_standard4kb_array.fields[0] = 0x006c6800u;
-  based_standard4kb_array.fields[4] = 0x00010001u;
-  TileSizeAlign based_standard4kb_size{};
-  TileGetTextureTotalSize(based_standard4kb_array.Format(), 1, 1,
-                          based_standard4kb_array.Depth() + 1u, 1,
-                          based_standard4kb_array.TileMode(), false,
-                          based_standard4kb_size);
-  Require("BasicStorageTexture", "based Standard4KB array view",
-          based_standard4kb_array.Base40() == 0x6c680000ull &&
-              based_standard4kb_array.BaseArray5() == 1 &&
-              based_standard4kb_array.Depth() == 1 &&
-              based_standard4kb_size.size == 0x2000 &&
-              based_standard4kb_size.align == 0x1000,
-          "captured based Standard4KB array view is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(),
-                         based_standard4kb_array, based_standard4kb_size.size);
-
-  const auto standard64kb = Standard64KBStorageTextureDescriptor();
-  TileSizeAlign standard64kb_size{};
-  TileGetTextureTotalSize(standard64kb.Format(), standard64kb.Width5() + 1u,
-                          standard64kb.Height5() + 1u,
-                          standard64kb.Depth() + 1u, 1, standard64kb.TileMode(),
-                          false, standard64kb_size);
-  Require("BasicStorageTexture", "Standard64KB 2D descriptor",
-          standard64kb.Type() == Prospero::ImageType::kColor2DArray &&
-              standard64kb.Format() == Prospero::BufferFormat::k8_8_8_8UNorm &&
-              standard64kb.TileMode() == Prospero::TileMode::kStandard64KB &&
-              standard64kb.DstSelXYZW() == DstSel(4, 5, 6, 7) &&
-              standard64kb_size.size == 0x10000 &&
-              standard64kb_size.align == 0x10000,
-          "captured Standard64KB storage descriptor is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), standard64kb,
-                         standard64kb_size.size);
-
-  const auto uint_volume = BasicUintVolumeStorageTextureDescriptor();
-  Require("BasicStorageTexture", "uint 3D descriptor",
-          uint_volume.Base40() == 0x2018060000ull &&
-              uint_volume.Width5() + 1u == 16 &&
-              uint_volume.Height5() + 1u == 16 &&
-              uint_volume.Depth() + 1u == 16 && uint_volume.BaseArray5() == 0 &&
-              uint_volume.Type() == Prospero::ImageType::kColor3D &&
-              uint_volume.Format() == Prospero::BufferFormat::k16UInt &&
-              uint_volume.TileMode() == Prospero::TileMode::kLinear &&
-              uint_volume.DstSelXYZW() == DstSel(4, 0, 0, 0),
-          "PPSA21268 uint 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintVolumeStorageTextureResource(), uint_volume,
-                         0x10000);
-
-  const ShaderTextureResource tiled_uint_volume{
-      {0x1ac0e530u, 0xc0b00000u, 0x0003c003u, 0xa0500004u, 0x0000000fu,
-       0x00700000u, 0x00000000u, 0x00000000u}};
-  Require("BasicStorageTexture", "tiled uint 3D descriptor",
-          tiled_uint_volume.Width5() + 1u == 16 &&
-              tiled_uint_volume.Height5() + 1u == 16 &&
-              tiled_uint_volume.Depth() + 1u == 16 &&
-              tiled_uint_volume.Type() == Prospero::ImageType::kColor3D &&
-              tiled_uint_volume.TileMode() == Prospero::TileMode::kStandard4KB,
-          "captured tiled uint 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintVolumeStorageTextureResource(),
-                         tiled_uint_volume, 0x2000);
-
-  const auto depth_tile = Ppsa14053DepthTileStorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA14053 depth-tile descriptor",
-          depth_tile.Base40() == 0x20144c0000ull &&
-              depth_tile.Width5() + 1u == 1 && depth_tile.Height5() + 1u == 1 &&
-              depth_tile.Depth() + 1u == 1 && depth_tile.BaseArray5() == 0 &&
-              depth_tile.Type() == Prospero::ImageType::kColor2DArray &&
-              depth_tile.Format() == Prospero::BufferFormat::k8UInt &&
-              depth_tile.TileMode() == Prospero::TileMode::kDepth &&
-              depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA14053 write-only depth-tile storage descriptor fixture is "
-          "malformed");
-  ValidateStorageTexture(Ppsa14053DepthTileStorageTextureResource(), depth_tile,
-                         0x10000);
-  const auto d16_depth_tile = Ppsa10112D16StorageTextureDescriptor();
-  Require("BasicStorageTexture", "PPSA10112 D16 depth-tile descriptor",
-          d16_depth_tile.Base40() == 0x205b900000ull &&
-              d16_depth_tile.Width5() + 1u == 240 &&
-              d16_depth_tile.Height5() + 1u == 135 &&
-              d16_depth_tile.Depth() + 1u == 1 &&
-              d16_depth_tile.Type() == Prospero::ImageType::kColor2DArray &&
-              d16_depth_tile.Format() == Prospero::BufferFormat::k16UNorm &&
-              d16_depth_tile.TileMode() == Prospero::TileMode::kDepth &&
-              d16_depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA10112 writable D16 depth-plane descriptor fixture is malformed");
-  const auto d16_pitch =
-      TileGetTexturePitch(d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u,
-                          d16_depth_tile.TileMode());
-  TileSizeAlign d16_size{};
-  TileGetTextureTotalSize(d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u,
-                          d16_depth_tile.Height5() + 1u,
-                          d16_depth_tile.Depth() + 1u, 1,
-                          d16_depth_tile.TileMode(), false, d16_size);
-  Require("BasicStorageTexture", "PPSA10112 D16 depth-tile footprint",
-          d16_pitch == 256 && d16_size.size == 0x20000 &&
-              d16_size.align == 0x10000,
-          "PPSA10112 writable D16 depth-plane footprint is incorrect");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), d16_depth_tile,
-                         d16_size.size);
-  auto depth_tile_r32 = depth_tile;
-  depth_tile_r32.fields[1] =
-      (depth_tile_r32.fields[1] & ~(0x1ffu << 20u)) |
-      (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u);
-  depth_tile_r32.fields[3] =
-      (depth_tile_r32.fields[3] & ~(0xfu << 28u)) |
-      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
-  auto depth_tile_r32_resource = Ppsa14053DepthTileStorageTextureResource();
-  depth_tile_r32_resource.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  ValidateStorageTexture(depth_tile_r32_resource, depth_tile_r32, 0x10000);
-  Require("BasicStorageTexture", "R32_UINT replicated write mapping",
-          IsValidImageSwizzle(DstSel(4, 4, 4, 4)),
-          "single-channel replicated destination selection was rejected");
-
-  const auto atomic = AtomicStorageTextureDescriptor();
-  Require("BasicStorageTexture", "atomic R32_UINT descriptor",
-          atomic.Width5() + 1u == 128 && atomic.Height5() + 1u == 1 &&
-              atomic.Depth() + 1u == 1 &&
-              atomic.Type() == Prospero::ImageType::kColor2D &&
-              atomic.Format() == Prospero::BufferFormat::k32UInt &&
-              atomic.DstSelXYZW() == DstSel(4, 0, 0, 1),
-          "PPSA22102 image-atomic descriptor fixture is malformed");
-  ValidateStorageTexture(AtomicStorageTextureResource(), atomic, 0x10000);
-
-  char path[MAX_PATH]{};
-  Require("BasicStorageTexture", "host",
-          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
-          "GetModuleFileName failed");
-  for (const char *kind : {"resource",
-                           "type",
-                           "standard256b-volume",
-                           "inverted-mip-range",
-                           "swizzle",
-                           "linear-rgb1-read",
-                           "bgra-read",
-                           "r16-float-read",
-                           "r8-unorm-read",
-                           "yzwx-read",
-                           "reserved-swizzle",
-                           "array-base-out-of-range",
-                           "reserved",
-                           "uint-format",
-                           "uint-resource-float-format",
-                           "atomic-format",
-                           "depth-tile-read",
-                           "depth-tile-extent",
-                           "depth-tile-fmask"}) {
-    std::string command = std::string("\"") + path +
-                          "\" --storage-texture-descriptor-death " + kind;
-    std::vector<char> mutable_command(command.begin(), command.end());
-    mutable_command.push_back('\0');
-    STARTUPINFOA startup{sizeof(startup)};
-    PROCESS_INFORMATION process{};
-    Require("BasicStorageTexture", "host",
-            CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
-                           FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                           &process) != 0,
-            "CreateProcess failed");
-    Require("BasicStorageTexture", "host",
-            WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
-            "descriptor death case timed out");
-    DWORD exit_code = 0;
-    const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    Require("BasicStorageTexture", "host", exited && exit_code == 321,
-            std::string(kind) +
-                " storage descriptor did not report a fatal error");
-  }
-  std::printf("[host]    %-32s ok\n", "BasicStorageTextureDescriptor");
-}
-#endif
 
 void CheckStorageTextureLinearUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k8_8_8_8UNorm;
@@ -30987,7 +30187,6 @@ void CheckNativeImageDescriptorTypes() {
   std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void CheckShaderRecompilerFatalContracts() {
   ExpectFatal("InvalidDescriptorBindingRejection", [] {
     (void)NativeDescriptorType(
@@ -31040,7 +30239,6 @@ void CheckShaderRecompilerFatalContracts() {
             "packed atomic image descriptor was accepted");
   }
 }
-#endif
 
 void CheckStorageTextureVolumeUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
@@ -31145,75 +30343,6 @@ void CheckStandard64RenderTargetTileRoundTrip() {
   std::printf("[host]    %-32s ok\n", "Standard64RenderTarget");
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-void CheckStorageTextureGpuOwnedRebindState() {
-  constexpr uintptr_t base = 0x0000000200200000ull;
-  constexpr uint64_t size = 0x10000;
-  const auto guest_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
-      base, size, Common::VirtualMemory::Mode::ReadWrite,
-      "storage_texture_gpu_owned_rebind", true);
-  auto *memory = reinterpret_cast<uint8_t *>(guest_memory);
-  Require("StorageTextureGpuOwnedRebind", "allocation", guest_memory == base,
-          "fixed guest-owner allocation failed");
-  PageManager page_manager;
-  MemoryTracker tracker(page_manager);
-  tracker.ForEachUploadRange(
-      base, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  uint64_t readable = 0;
-  uint64_t mapped = 0;
-  MEMORY_BASIC_INFORMATION protection{};
-  Require(
-      "StorageTextureGpuOwnedRebind", "owned",
-      tracker.IsRegionGpuModified(base, size) &&
-          (!HostMemoryQueryReadable(base, size, readable) || readable < size) &&
-          HostMemoryQueryRange(base, size, HostMemoryAccess::Mapped, mapped) &&
-          mapped == size &&
-          VirtualQuery(memory, &protection, sizeof(protection)) != 0 &&
-          protection.Protect == PAGE_NOACCESS,
-      "GPU-owned storage pages remained host-readable or lost tracker "
-      "identity");
-
-  tracker.UnmarkRegionAsGpuModified(base, size);
-  readable = 0;
-  Require("StorageTextureGpuOwnedRebind", "clean readback",
-          !tracker.IsRegionGpuModified(base, size) &&
-              !tracker.IsRegionCpuModified(base, size) &&
-              HostMemoryQueryReadable(base, size, readable) && readable == size,
-          "clean storage readback did not publish readable coherent backing");
-  tracker.MarkRegionAsGpuModified(base, size);
-  readable = 0;
-  Require(
-      "StorageTextureGpuOwnedRebind", "clean reclaim",
-      tracker.IsRegionGpuModified(base, size) &&
-          !tracker.IsRegionCpuModified(base, size) &&
-          (!HostMemoryQueryReadable(base, size, readable) || readable < size),
-      "clean storage rebind did not reclaim GPU ownership without an upload");
-
-  tracker.UnmarkRegionAsGpuModified(base, size);
-  tracker.MarkRegionAsCpuModified(base, size);
-  uint32_t dirty_ranges = 0;
-  bool upload_called = false;
-  tracker.ForEachUploadRange(
-      base, size, true, [&](uint64_t, uint64_t) noexcept { dirty_ranges++; },
-      [&]() noexcept { upload_called = true; });
-  readable = 0;
-  Require(
-      "StorageTextureGpuOwnedRebind", "dirty refresh",
-      dirty_ranges == 1 && upload_called &&
-          tracker.IsRegionGpuModified(base, size) &&
-          !tracker.IsRegionCpuModified(base, size) &&
-          (!HostMemoryQueryReadable(base, size, readable) || readable < size),
-      "CPU-dirty storage rebind did not refresh once and reclaim GPU "
-      "ownership");
-
-  tracker.UnmarkRegionAsGpuModified(base, size);
-  tracker.UntrackMemory(base, size);
-  Require("StorageTextureGpuOwnedRebind", "free",
-          Libs::LibKernel::Memory::FreeGuestMemory(base, size),
-          "guest-owner free failed");
-  std::printf("[host]    %-32s ok\n", "StorageTextureGpuOwnedRebind");
-}
-#endif
 
 void CheckNativeMsaaState() {
   Require("NativeMsaaState", "sample encoding",
@@ -33267,12 +32396,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageLoadR32UintUsesIntegerSampledImage());
     return 0;
   }
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--shader-fatal-only") == 0) {
     CheckShaderRecompilerFatalContracts();
     return 0;
   }
-#endif
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
@@ -33610,93 +32737,6 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
-    RunReverseRenderTargetDeathCase();
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
-    CheckRenderTargetFormatContract();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
-    CheckStandard64RenderTargetTileRoundTrip();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--standard-tile-rt-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
-    VulkanHarness vulkan;
-    CheckSampledColorViews();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
-    VulkanHarness vulkan;
-    CheckImageTransitionState(vulkan.RuntimeRenderer());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
-    CheckSampledColorViews();
-    CheckBasicStorageTextureDescriptor();
-    VulkanHarness vulkan;
-    vulkan.CheckUnifiedImageViewCache();
-    RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--storage-mip-only") == 0) {
-    RunCase(nullptr, ImageStoreMipSelectsPpsa01340Descriptor());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--storage-yzwx-only") == 0) {
-    CheckSampledColorViews();
-    CheckBasicStorageTextureDescriptor();
-    CheckStorageTextureGpuOwnedRebindState();
-    VulkanHarness vulkan;
-    RunCase(&vulkan, ImageStoreYzwxUsesInverseSwizzle());
-    return 0;
-  }
-  if (argc == 3 && std::strcmp(argv[1], "--image-view-death") == 0) {
-    RunImageViewDeathCase(argv[2]);
-  }
-  if (argc == 3 &&
-      std::strcmp(argv[1], "--storage-texture-descriptor-death") == 0) {
-    RunStorageTextureDescriptorDeathCase(argv[2]);
-  }
-  if (argc != 1) {
-    std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);
-    return 2;
-  }
-  VulkanHarness vulkan;
-  CheckRenderTargetFormatContract();
-  CheckSampledColorViews();
-  CheckImageTransitionState(vulkan.RuntimeRenderer());
-  CheckSampledDepthResource();
-  CheckDepthTextureEncoding();
-  vulkan.CheckComparisonDepthTexture();
-  vulkan.CheckRasterization(true);
-  CheckBasicStorageTextureDescriptor();
-  CheckStorageTextureLinearUploadLayout();
-  CheckStorageTextureDepthTileUploadLayout();
-  CheckStandard64RenderTargetTileRoundTrip();
-  CheckStorageTextureVolumeUploadLayout();
-  CheckStorageTextureVolumeMipRegions();
-  CheckStorageTextureGpuOwnedRebindState();
-  CheckNativeMsaaState();
-  CheckPs5DepthRegisterDecoding();
-  CheckDepthHtileStencilCompatibility();
-  CheckDepthAttachmentWrites();
-  CheckDepthFeedbackAspects();
-  CheckDynamicRenderingState();
-  CheckDepthTargetFootprints();
-  CheckSlotVectorLifetime();
-#else
   if (argc != 1) {
     std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);
     return 2;
@@ -33704,7 +32744,6 @@ int main(int argc, char **argv) {
   CheckShaderRecompilerFatalContracts();
   CheckDepthFeedbackAspects();
   VulkanHarness vulkan;
-#endif
   CheckImageSamplerSpecialization();
   CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();
@@ -33747,20 +32786,6 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  vulkan.CheckRenderExecutorColorDiscovery();
-  vulkan.CheckRenderExecutorColorVolumeDiscovery();
-  vulkan.CheckRenderExecutorDccFixedClearFloat();
-  vulkan.CheckSampledDccClear();
-  vulkan.CheckRenderExecutorColorStandardTileDiscovery();
-  vulkan.CheckRenderExecutorColorDepthTileDiscovery();
-  vulkan.CheckRenderExecutorStencilBindingDiscovery();
-  vulkan.CheckUnifiedTextureCacheFlow();
-  vulkan.CheckBgra16Readback();
-  vulkan.CheckRasterization(false);
-  vulkan.CheckRasterization(false, true);
-  vulkan.CheckBufferCacheDirtyGarbageCollection();
-#endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

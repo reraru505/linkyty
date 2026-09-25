@@ -7,12 +7,8 @@
 #include <fstream>
 #include <limits>
 
-#ifdef _WIN32
-#include <process.h>
-#else
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
 
 namespace {
 std::string           g_test_title = "PPSA21564";
@@ -532,14 +528,6 @@ void TestClassicSaveParams() {
 		transfer.title_id = &source_title;
 		CHECK(fs::remove("_SaveData/P_ALIAS"));
 	}
-#ifdef _WIN32
-	SceSaveDataTitleId lowercase_title {};
-	std::strcpy(lowercase_title.data, "params");
-	transfer.title_id = &lowercase_title;
-	SaveDataMountResult duplicate {};
-	CHECK(SaveDataTransferringMount(&transfer, &duplicate) == SAVE_DATA_ERROR_BUSY);
-	transfer.title_id = &source_title;
-#endif
 
 	SaveDataMountResult other {};
 	CHECK(SaveDataMount3(&mount, &other) == OK);
@@ -578,10 +566,6 @@ void TestClassicSaveParams() {
 }
 
 void RunChild(const fs::path& executable, const char* mode) {
-#ifdef _WIN32
-	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
-	              static_cast<char*>(nullptr)) == 0);
-#else
 	const pid_t pid = fork();
 	CHECK(pid >= 0);
 	if (pid == 0) {
@@ -591,7 +575,6 @@ void RunChild(const fs::path& executable, const char* mode) {
 	int status = 0;
 	CHECK(waitpid(pid, &status, 0) == pid);
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-#endif
 }
 } // namespace
 

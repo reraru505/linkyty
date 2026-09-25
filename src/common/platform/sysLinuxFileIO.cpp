@@ -1,8 +1,5 @@
 #include "common/common.h"
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_LINUX
-// #error "KYTY_PLATFORM != KYTY_PLATFORM_LINUX"
-#else
 
 #include "common/assert.h"
 #include "common/platform/sysFileIO.h"
@@ -45,13 +42,8 @@ struct sys_file_t {
 };
 
 // Darwin uses BSD timestamp member names.
-#if defined(__APPLE__)
-#define KYTY_STAT_ATIME_NS(st) ((st).st_atimespec.tv_nsec)
-#define KYTY_STAT_MTIME_NS(st) ((st).st_mtimespec.tv_nsec)
-#else
 #define KYTY_STAT_ATIME_NS(st) ((st).st_atim.tv_nsec)
 #define KYTY_STAT_MTIME_NS(st) ((st).st_mtim.tv_nsec)
-#endif
 
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
 	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
@@ -63,7 +55,6 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 		return;
 	}
 
-#if !defined(__APPLE__)
 	int advice = POSIX_FADV_NORMAL;
 	switch (cache_type) {
 		case SYS_FILE_CACHE_RANDOM_ACCESS: advice = POSIX_FADV_RANDOM; break;
@@ -72,13 +63,6 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 		default: return;
 	}
 	::posix_fadvise(fileno(f), 0, 0, advice);
-#else
-	if (cache_type == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
-		::fcntl(fileno(f), F_RDAHEAD, 1);
-	} else if (cache_type == SYS_FILE_CACHE_RANDOM_ACCESS) {
-		::fcntl(fileno(f), F_RDAHEAD, 0);
-	}
-#endif
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -671,4 +655,3 @@ void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
 }
 
-#endif

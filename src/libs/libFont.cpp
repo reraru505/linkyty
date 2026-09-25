@@ -18,10 +18,6 @@
 #include <unordered_set>
 #include <vector>
 
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4244 4267 4701)
-#endif
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wimplicit-fallthrough"
@@ -32,9 +28,6 @@
 #include "stb_truetype.h"
 #if defined(__clang__)
 #pragma clang diagnostic pop
-#endif
-#if defined(_MSC_VER)
-#pragma warning(pop)
 #endif
 
 extern "C" {

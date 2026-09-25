@@ -11,16 +11,7 @@
 #include <renderdoc_app.h>
 #include <string>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#undef min
-#undef max
-#else
 #include <dlfcn.h>
-#endif
 
 namespace Libs::Graphics {
 
@@ -35,14 +26,8 @@ static std::atomic<RenderDocState> g_state           = RenderDocState::Idle;
 static uint32_t                    g_captured_flips  = 0;
 static std::atomic_bool            g_unavailable_log = false;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-
-static bool BindRenderDocApi(HMODULE module) {
-	auto* get_api = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(module, "RENDERDOC_GetAPI"));
-#else
 static bool BindRenderDocApi(void* module) {
 	auto* get_api = reinterpret_cast<pRENDERDOC_GetAPI>(::dlsym(module, "RENDERDOC_GetAPI"));
-#endif
 	if (get_api == nullptr) {
 		return false;
 	}
@@ -59,44 +44,6 @@ static bool BindRenderDocApi(void* module) {
 	return true;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-
-void RenderDocInit() {
-	if (g_api != nullptr) {
-		return;
-	}
-
-	auto* module = GetModuleHandleA("renderdoc.dll");
-	if (module == nullptr) {
-		HKEY key = nullptr;
-		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-		                  L"SOFTWARE\\Classes\\RenderDoc.RDCCapture.1\\DefaultIcon\\", 0, KEY_READ,
-		                  &key) != ERROR_SUCCESS) {
-			return;
-		}
-
-		std::array<wchar_t, MAX_PATH> path_buffer {};
-		DWORD      path_size = static_cast<DWORD>(path_buffer.size() * sizeof(wchar_t));
-		const auto result    = RegQueryValueExW(
-		    key, L"", nullptr, nullptr, reinterpret_cast<LPBYTE>(path_buffer.data()), &path_size);
-		RegCloseKey(key);
-		if (result != ERROR_SUCCESS) {
-			return;
-		}
-
-		auto path = std::filesystem::path(path_buffer.data()).parent_path() / "renderdoc.dll";
-		module    = LoadLibraryW(path.c_str());
-		if (module == nullptr) {
-			return;
-		}
-	}
-
-	if (!BindRenderDocApi(module)) {
-		LOGF("RenderDoc: API 1.6.0 is unavailable\n");
-	}
-}
-
-#else
 
 void RenderDocInit() {
 	if (g_api != nullptr) {
@@ -117,7 +64,6 @@ void RenderDocInit() {
 	}
 }
 
-#endif
 
 void RenderDocRequestCapture() {
 	if (g_api == nullptr) {

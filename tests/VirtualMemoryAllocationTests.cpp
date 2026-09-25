@@ -27,10 +27,8 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
 #include <immintrin.h>
-#endif
 
 // xbyak is a host-side code generator used only by the packed-reciprocal-square-root
 // instruction-emulation case below. The engine itself no longer depends on xbyak: the pure-Zig
@@ -44,21 +42,10 @@
 #endif
 #endif
 
-#if defined(__linux__)
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
-#endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#ifdef DeleteFile
-#undef DeleteFile
-#endif
-#endif
 
 namespace Libs::Fiber {
 struct FiberObject;
@@ -175,102 +162,9 @@ void InitSubsystems() {
 	initialized = true;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-void* g_red_zone_fault_page = nullptr;
-
-LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
-	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
-	    exception->ContextRecord == nullptr ||
-	    exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
-	    reinterpret_cast<void*>(exception->ExceptionRecord->ExceptionInformation[1]) !=
-	        g_red_zone_fault_page) {
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
-
-	// Model the Windows exception stack footprint that prompted the static patch:
-	// data below the interrupted RSP is not part of the Windows ABI contract.
-	*reinterpret_cast<uint64_t*>(exception->ContextRecord->Rsp - 0x18) = 0;
-	DWORD old_protection = 0;
-	if (VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_READWRITE, &old_protection) == FALSE) {
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
-	return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-void TestWindowsGuestRedZoneStaticPatcher() {
-	const char* test = "WindowsGuestRedZoneStaticPatcher";
-	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
-	constexpr uint64_t CODE_SIZE = 0x4000;
-	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
-	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0x0000000902000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
-	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_patcher_test");
-	Check(test, mapping != 0, "failed to allocate patch test code");
-
-	std::vector<uint8_t> code;
-	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
-		code.insert(code.end(), bytes.begin(), bytes.end());
-	};
-	const auto emit64 = [&code](uint64_t value) {
-		const auto offset = code.size();
-		code.resize(offset + sizeof(value));
-		std::memcpy(code.data() + offset, &value, sizeof(value));
-	};
-	emit({0x48, 0xb8});
-	emit64(SENTINEL);                         // movabs rax, sentinel
-	emit({0x48, 0x89, 0x44, 0x24, 0xe8});     // mov [rsp-0x18], rax
-	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
-	emit({0x48, 0x8b, 0x44, 0x24, 0xe8});     // mov rax, [rsp-0x18]
-	emit({0x48, 0xb9});
-	emit64(SENTINEL);                         // movabs rcx, sentinel
-	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
-	emit({0x0f, 0x94, 0xc0});                 // sete al
-	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
-	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
-	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
-	      "failed to flush generated test code");
-
-	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
-	auto* handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
-	Check(test, handler != nullptr, "failed to install test exception handler");
-
-	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
-	const auto function = reinterpret_cast<GuestFunction>(mapping);
-	const bool unpatched_was_corrupted = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
-
-	DWORD old_protection = 0;
-	Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
-	      "failed to reset fault page protection");
-	Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
-	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
-	                                   TRAMPOLINE_SIZE);
-	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
-	const auto result = Loader::PatchGuestInstructions(
-	    mapping, code.size(), function_starts, true, false);
-	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
-
-	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
-	RemoveVectoredExceptionHandler(handler);
-	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
-	g_red_zone_fault_page = nullptr;
-	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
-
-	Check(test, unpatched_was_corrupted, "test harness did not reproduce red-zone corruption");
-	Check(test, result.red_zone_function_count == 1 && result.memory_instruction_count >= 1 &&
-	                result.patched_memory_instruction_count >= 1 &&
-	                result.unrelocatable_memory_instruction_count == 0,
-	      "static patcher did not cover the faultable instruction");
-	Check(test, patched_preserved, "patched fault still corrupted the guest red zone");
-	Check(test, freed, "failed to free patch test code");
-	std::printf("[host]    %-48s ok\n", test);
-}
-#else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
 }
-#endif
 
 void RunTest(void (*test_func)()) {
 	if (g_failed_tests != 0) {
@@ -1287,7 +1181,6 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-#if defined(__linux__)
 void TestPartialUnmapPreservesHostPermissions() {
 	const char* test = "PartialUnmapPreservesHostPermissions";
 	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
@@ -1322,7 +1215,6 @@ void TestPartialUnmapPreservesHostPermissions() {
 	        "KernelMunmap(right cleanup)");
 	std::printf("[host]    %-48s ok\n", test);
 }
-#endif
 
 void TestDirectMapValidationBeforeOwnerMutation() {
 	const char* test    = "DirectMapValidationBeforeOwnerMutation";
@@ -1703,13 +1595,6 @@ void TestDefaultDirectMapUsesSystemAddressRange() {
 	                                                            SceKernelPageSize, "system_direct"),
 	        "KernelMapNamedDirectMemory");
 	Check(test, address != nullptr, "direct mapping returned null");
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	constexpr uint64_t SystemManagedMin = 0x0000040000ull;
-	constexpr uint64_t SystemManagedMax = 0x07fffeffffull;
-	const auto         mapped           = reinterpret_cast<uint64_t>(address);
-	Check(test, mapped >= SystemManagedMin && mapped + SceKernelPageSize - 1 <= SystemManagedMax,
-	      "default direct mapping fell outside the system-managed host range");
-#endif
 
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(address),
@@ -2657,7 +2542,7 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-#if (defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS) && defined(KYTY_VM_TEST_HAVE_XBYAK)
+#if defined(KYTY_VM_TEST_HAVE_XBYAK)
 volatile sig_atomic_t g_rsqrt_traps = 0;
 
 bool EmulateReciprocalSquareRootContext(void* context) {
@@ -2673,30 +2558,16 @@ bool EmulateReciprocalSquareRootContext(void* context) {
 	return true;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-LONG CALLBACK ReciprocalSquareRootHandler(EXCEPTION_POINTERS* exception) {
-	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION ||
-	    !EmulateReciprocalSquareRootContext(exception->ContextRecord)) {
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
-	return EXCEPTION_CONTINUE_EXECUTION;
-}
-#else
 void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
 	if (!EmulateReciprocalSquareRootContext(context)) {
 		_exit(190);
 	}
 }
-#endif
 
 void TestPackedReciprocalSquareRoot() {
 	const char* test = "PackedReciprocalSquareRoot";
 	constexpr uint64_t code_size = 0x4000;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	constexpr uint64_t allocation_size = code_size * 2;
-#else
 	constexpr uint64_t allocation_size = code_size;
-#endif
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
 	Check(test, mapping != 0, "failed to allocate instruction test code");
@@ -2704,38 +2575,22 @@ void TestPackedReciprocalSquareRoot() {
 		uint64_t mapping;
 		uint64_t size;
 		uint32_t mxcsr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		void* handler = nullptr;
-#else
 		struct sigaction previous {};
 		bool installed = false;
-#endif
 		~RestoreState() {
 			_mm_setcsr(mxcsr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (handler != nullptr) {
-				RemoveVectoredExceptionHandler(handler);
-			}
-			Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
-#else
 			if (installed) {
 				sigaction(SIGILL, &previous, nullptr);
 			}
-#endif
 			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
 		}
 	} restore {mapping, allocation_size, _mm_getcsr()};
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	restore.handler = AddVectoredExceptionHandler(1, ReciprocalSquareRootHandler);
-	Check(test, restore.handler != nullptr, "failed to install instruction handler");
-#else
 	struct sigaction action {};
 	action.sa_sigaction = ReciprocalSquareRootHandler;
 	action.sa_flags = SA_SIGINFO;
 	sigemptyset(&action.sa_mask);
 	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
 	Check(test, restore.installed, "failed to install instruction handler");
-#endif
 	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
 	const auto refine = [](float estimate) {
@@ -2775,9 +2630,7 @@ void TestPackedReciprocalSquareRoot() {
 		code.vmovups(code.ptr[code.rsi + 32], Xbyak::Ymm(source));
 		code.vzeroupper();
 		code.ret();
-#if defined(__linux__)
 		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
-#endif
 		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
 		      "failed to flush generated instruction test code");
 		function(input.data(), output.data());
@@ -2796,21 +2649,6 @@ void TestPackedReciprocalSquareRoot() {
 		Check(test, red_zone_intact(), "native instruction corrupted the guest red zone");
 		Check(test, std::isfinite(native) && std::abs(native - std::bit_cast<float>(expected)) < 0.001f,
 		      "native reciprocal root is outside its error bound");
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), code_size,
-		                                   reinterpret_cast<void*>(mapping + code_size), code_size);
-		const std::array<uintptr_t, 1> function_starts {mapping};
-		// The extended-register case also relocates ordinary memory accesses while
-		// red-zone data is live, exercising both enabled patchers in one function.
-		const bool protect_memory = source == 9;
-		const auto patched = Loader::PatchGuestInstructions(
-		    mapping, code.getSize(), function_starts, protect_memory, true);
-		Check(test, patched.reciprocal_sqrt_instruction_count == 1 &&
-		                patched.unrelocatable_memory_instruction_count == 0 &&
-		                (protect_memory ? patched.patched_memory_instruction_count > 0
-		                                : patched.patched_memory_instruction_count == 0),
-		      "instruction pass lost reciprocal root or memory patch coverage");
-#else
 		Check(test, Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(mapping, code.getSize()) == 1,
 		      "instruction pass did not patch exactly one packed reciprocal root");
 		const auto* patched = reinterpret_cast<const uint8_t*>(mapping);
@@ -2821,7 +2659,6 @@ void TestPackedReciprocalSquareRoot() {
 		Check(test, changed == 1, "instruction pass changed unrelated code bytes");
 		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
 		      "failed to flush patched instruction test code");
-#endif
 		const auto before = g_rsqrt_traps;
 		function(input.data(), output.data());
 		Check(test, g_rsqrt_traps == before + 1, "patched instruction did not execute its handler");
@@ -2871,7 +2708,6 @@ void TestPackedReciprocalSquareRoot() {
 		}
 		input.fill(0x3f800000);
 	}
-#if defined(__linux__)
 	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
 	ucontext_t context {};
 	context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(unknown.data());
@@ -2926,7 +2762,6 @@ void TestPackedReciprocalSquareRoot() {
 	Check(test, std::equal(sha_expected.begin(), sha_expected.end(), fpstate._xmm[8].element),
 	      "SHA emulation lost its memory operand or extended destination register");
 	emulate({0x0f, 0x01, 0xfa}, 3); // monitorx
-#endif
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -3115,7 +2950,7 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
-#if (defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS) && defined(KYTY_VM_TEST_HAVE_XBYAK)
+#if defined(KYTY_VM_TEST_HAVE_XBYAK)
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -3129,9 +2964,9 @@ int main(int argc, char** argv) {
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
 #endif
-#if (defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS) && defined(KYTY_VM_TEST_HAVE_XBYAK)
+#if defined(KYTY_VM_TEST_HAVE_XBYAK)
 	RunTest(TestPackedReciprocalSquareRoot);
-#elif defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#elif defined(__linux__)
 	std::printf("[skip]    %-48s xbyak header not available\n", "PackedReciprocalSquareRoot");
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
@@ -3159,9 +2994,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-#if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
-#endif
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
